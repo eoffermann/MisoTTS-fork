@@ -36,12 +36,18 @@ log("Imports complete.")
 
 
 # Each entry: target audio length in seconds + a generous cap (max_audio_length_ms)
-# + 5 sentences per emotion (sad / angry / normal / excited) sized to roughly hit
-# the target when spoken at a natural pace (~2.5 words/sec).
+# + 5 sentences per emotion (sad / angry / normal / excited).
+#
+# Caps are set well above the target lengths: the model speaks far slower than a
+# ~2.5 words/sec estimate would suggest (measured ~1.1 words/sec on these
+# prompts, e.g. a 30-word "medium" line reaches its natural end-of-speech token
+# at ~27 s, not ~12 s). With the old 10/15/22 s caps, medium and long clips were
+# cut off mid-sentence before the model emitted EOS. These caps let clips reach
+# their natural end; clips that finish early stop at EOS regardless of the cap.
 PROMPTS = {
     "short": {
         "target_s": 5,
-        "max_ms": 10_000,
+        "max_ms": 20_000,
         "by_emotion": {
             "sad": [
                 "I just feel so empty inside today, like nothing matters anymore.",
@@ -75,7 +81,7 @@ PROMPTS = {
     },
     "medium": {
         "target_s": 10,
-        "max_ms": 15_000,
+        "max_ms": 40_000,
         "by_emotion": {
             "sad": [
                 "I sat alone in the dark, thinking about everything that went wrong, every choice I made, every single person I hurt along the way. It's overwhelming.",
@@ -109,7 +115,7 @@ PROMPTS = {
     },
     "long": {
         "target_s": 15,
-        "max_ms": 22_000,
+        "max_ms": 50_000,
         "by_emotion": {
             "sad": [
                 "It's been three months since the accident, and I still wake up every morning expecting to hear his footsteps in the kitchen, the coffee maker running, his soft humming. The silence is what hurts the most, the absolute, devastating silence of an empty house.",
