@@ -112,7 +112,7 @@ scores candidate renders against a baseline (ASR intelligibility, MOS-style
 predictors, reference fidelity, and end-truncation detectors) and gates
 regressions. Every fix above was checked through it before landing.
 
-## Deployment
+## Deployment (Docker)
 
 A Linux/CUDA container serves the model behind two surfaces: a RunPod serverless
 handler (with a local simulator) and an OpenAI-compatible `POST /v1/audio/speech`,
