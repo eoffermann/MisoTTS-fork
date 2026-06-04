@@ -174,7 +174,14 @@ class Generator:
         for _ in range(max_generation_len):
             sample = self._model.generate_frame(curr_tokens, curr_tokens_mask, curr_pos, temperature, topk)
             if torch.all(sample == 0):
-                break  # eos
+                # EOS. Yield this final (all-zero) frame before stopping so the
+                # Mimi decoder still renders the trailing decay of the last real
+                # frame. Dropping it chops the tail: the clip ends abruptly at
+                # speech energy mid-decay (measured tail/speech ~0.9 on affected
+                # clips); including it lets the codec complete the final sound
+                # and trail to silence. See perf_eval/investigate_truncation.py.
+                yield sample
+                break
 
             curr_tokens = torch.cat([sample, torch.zeros(1, 1).long().to(self.device)], dim=1).unsqueeze(1)
             curr_tokens_mask = torch.cat(
