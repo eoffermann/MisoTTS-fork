@@ -194,6 +194,22 @@ class Generator:
     def _decode_frames(self, samples: List[torch.Tensor]) -> torch.Tensor:
         return self._audio_tokenizer.decode(_stack_audio_frames(samples)).squeeze(0).squeeze(0)
 
+    def _tail_is_chopped(self, audio: torch.Tensor, thresh: float = 0.35) -> bool:
+        """True if the clip ends near speech energy (abrupt cutoff) rather than
+        trailing to silence. Compares the RMS of the final 120 ms against a
+        high percentile of frame RMS (the speech level)."""
+        sr = self.sample_rate
+        n = audio.shape[0]
+        if n < int(0.25 * sr):
+            return False
+        x = audio.detach().float()
+        fw = max(1, int(0.02 * sr))
+        nf = n // fw
+        rms = (x[: nf * fw].reshape(nf, fw).pow(2).mean(dim=1) + 1e-12).sqrt()
+        speech = torch.quantile(rms, 0.9)
+        tail = (x[-int(0.12 * sr):].pow(2).mean() + 1e-12).sqrt()
+        return bool(speech > 0 and (tail / speech) > thresh)
+
     def _watermark_audio(self, audio: torch.Tensor) -> torch.Tensor:
         # This applies an imperceptible watermark to identify audio as AI-generated.
         # If using Miso TTS in another application, use your own private key and keep it secret.
@@ -234,7 +250,15 @@ class Generator:
             self._generate_frames(prompt_tokens, prompt_tokens_mask, max_generation_len, temperature, topk)
         )
 
-        audio = self._decode_frames(samples)
+        # _generate_frames yields the trailing all-zero EOS frame so the codec
+        # can render the final decay. But on clips that already trail to silence
+        # before EOS, decoding that frame adds a faint blip. Decode WITHOUT it
+        # first; only re-decode WITH it when the clip would otherwise end chopped.
+        has_eos = len(samples) > 1 and bool((samples[-1] == 0).all())
+        core = samples[:-1] if has_eos else samples
+        audio = self._decode_frames(core)
+        if has_eos and self._tail_is_chopped(audio):
+            audio = self._decode_frames(samples)
         audio = self._watermark_audio(audio)
 
         return audio
