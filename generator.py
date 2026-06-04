@@ -127,15 +127,13 @@ class Generator:
 
         return torch.cat([text_tokens, audio_tokens], dim=0), torch.cat([text_masks, audio_masks], dim=0)
 
-    def _generate_frames(
+    def _prepare_prompt(
         self,
         text: str,
         speaker: int,
         context: List[Segment],
-        max_audio_length_ms: float = 90_000,
-        temperature: float = 0.9,
-        topk: int = 50,
-    ) -> Iterator[torch.Tensor]:
+        max_audio_length_ms: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
         self._model.reset_caches()
 
         max_generation_len = int(max_audio_length_ms / 80)
@@ -152,16 +150,26 @@ class Generator:
         prompt_tokens = torch.cat(tokens, dim=0).long().to(self.device)
         prompt_tokens_mask = torch.cat(tokens_mask, dim=0).bool().to(self.device)
 
-        curr_tokens = prompt_tokens.unsqueeze(0)
-        curr_tokens_mask = prompt_tokens_mask.unsqueeze(0)
-        curr_pos = torch.arange(0, prompt_tokens.size(0)).unsqueeze(0).long().to(self.device)
-
         max_seq_len = 2048
         max_context_len = max_seq_len - max_generation_len
-        if curr_tokens.size(1) >= max_context_len:
+        if prompt_tokens.size(0) >= max_context_len:
             raise ValueError(
                 f"Inputs too long, must be below max_seq_len - max_generation_len: {max_context_len}"
             )
+
+        return prompt_tokens, prompt_tokens_mask, max_generation_len
+
+    def _generate_frames(
+        self,
+        prompt_tokens: torch.Tensor,
+        prompt_tokens_mask: torch.Tensor,
+        max_generation_len: int,
+        temperature: float,
+        topk: int,
+    ) -> Iterator[torch.Tensor]:
+        curr_tokens = prompt_tokens.unsqueeze(0)
+        curr_tokens_mask = prompt_tokens_mask.unsqueeze(0)
+        curr_pos = torch.arange(0, prompt_tokens.size(0)).unsqueeze(0).long().to(self.device)
 
         for _ in range(max_generation_len):
             sample = self._model.generate_frame(curr_tokens, curr_tokens_mask, curr_pos, temperature, topk)
@@ -208,15 +216,11 @@ class Generator:
         temperature: float = 0.9,
         topk: int = 50,
     ) -> torch.Tensor:
+        prompt_tokens, prompt_tokens_mask, max_generation_len = self._prepare_prompt(
+            text, speaker, context, max_audio_length_ms
+        )
         samples = list(
-            self._generate_frames(
-                text=text,
-                speaker=speaker,
-                context=context,
-                max_audio_length_ms=max_audio_length_ms,
-                temperature=temperature,
-                topk=topk,
-            )
+            self._generate_frames(prompt_tokens, prompt_tokens_mask, max_generation_len, temperature, topk)
         )
 
         audio = self._decode_frames(samples)
@@ -237,56 +241,79 @@ class Generator:
         if chunk_frames <= 0:
             raise ValueError("chunk_frames must be greater than 0")
 
-        # Keep inference mode inside the generator body. Decorating a generator
-        # function only wraps iterator construction, not iteration.
+        # Tokenize the prompt (including Mimi encode of any context audio) before
+        # entering Mimi streaming mode, so streamed generation conditions on the
+        # same context tokens as generate().
         with torch.inference_mode():
-            chunk: List[torch.Tensor] = []
-            all_samples: List[torch.Tensor] = []
-            streamed_num_samples = 0
-            pending_final_audio: Optional[torch.Tensor] = None
+            prompt_tokens, prompt_tokens_mask, max_generation_len = self._prepare_prompt(
+                text, speaker, context, max_audio_length_ms
+            )
 
-            with self._audio_tokenizer.streaming(1):
-                for sample in self._generate_frames(
-                    text=text,
-                    speaker=speaker,
-                    context=context,
-                    max_audio_length_ms=max_audio_length_ms,
-                    temperature=temperature,
-                    topk=topk,
-                ):
-                    chunk.append(sample)
-                    all_samples.append(sample)
+        frames = self._generate_frames(prompt_tokens, prompt_tokens_mask, max_generation_len, temperature, topk)
+
+        chunk: List[torch.Tensor] = []
+        all_samples: List[torch.Tensor] = []
+        streamed_num_samples = 0
+        pending_final_audio: Optional[torch.Tensor] = None
+
+        # Each chunk is computed fully inside torch.inference_mode() and yielded
+        # outside it. A plain `with torch.inference_mode():` around the whole
+        # generator body would stay active while the generator is suspended at
+        # `yield`, silently putting the caller's loop body into inference mode.
+        with self._audio_tokenizer.streaming(1):
+            finished = False
+            while not finished:
+                out: Optional[torch.Tensor] = None
+                with torch.inference_mode():
+                    while len(chunk) < chunk_frames:
+                        sample = next(frames, None)
+                        if sample is None:
+                            finished = True
+                            break
+                        chunk.append(sample)
+                        all_samples.append(sample)
 
                     if len(chunk) == chunk_frames:
                         audio = self._decode_frames(chunk)
                         streamed_num_samples += audio.size(0)
                         chunk = []
                         if audio.numel() > 0:
-                            yield self._watermark_stream_chunk(audio, is_final=False)
+                            out = self._watermark_stream_chunk(audio, is_final=False)
+                if out is not None:
+                    yield out
 
+            with torch.inference_mode():
                 if chunk:
                     audio = self._decode_frames(chunk)
                     streamed_num_samples += audio.size(0)
                     if audio.numel() > 0:
                         pending_final_audio = audio
 
+        final_chunks: List[torch.Tensor] = []
+        with torch.inference_mode():
             if all_samples:
                 # Mimi streaming decode does not expose an explicit flush. Decode
-                # the full code sequence once and emit only the deferred tail so
-                # concatenated stream chunks keep the batch decode length.
+                # the full code sequence once (in batch mode, outside the streaming
+                # context) and emit only the deferred tail so concatenated stream
+                # chunks keep the batch decode length.
                 full_audio = self._decode_frames(all_samples)
                 tail = None
                 if streamed_num_samples < full_audio.size(0):
                     tail = full_audio[streamed_num_samples:]
 
                 if pending_final_audio is not None:
-                    yield self._watermark_stream_chunk(
-                        pending_final_audio,
-                        is_final=tail is None or tail.numel() == 0,
+                    final_chunks.append(
+                        self._watermark_stream_chunk(
+                            pending_final_audio,
+                            is_final=tail is None or tail.numel() == 0,
+                        )
                     )
 
                 if tail is not None and tail.numel() > 0:
-                    yield self._watermark_stream_chunk(tail, is_final=True)
+                    final_chunks.append(self._watermark_stream_chunk(tail, is_final=True))
+
+        for out in final_chunks:
+            yield out
 
 
 def _state_dict_from_checkpoint(checkpoint: object) -> dict[str, torch.Tensor]:
