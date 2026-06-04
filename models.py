@@ -196,8 +196,19 @@ class Model(
         curr_sample = c0_sample.clone()
         curr_pos = torch.arange(0, curr_h.size(1), device=curr_h.device).unsqueeze(0).repeat(curr_h.size(0), 1)
 
-        # Decoder caches must be reset every frame.
-        self.decoder.reset_caches()
+        # Decoder caches must be rewound every frame. The stock
+        # reset_caches() -> KVCache.reset() does `cache_pos -= cache_pos[0].item()`,
+        # an .item() device->host sync per decoder layer every frame (~8 syncs
+        # per frame, thousands per utterance) that serializes the GPU pipeline --
+        # defeating the codebase's no-sync sampling design. The decoder writes
+        # all `audio_num_codebooks` positions each frame before reading them
+        # under a causal mask, so the buffer zeroing reset() also does is
+        # unnecessary. Rewind cache_pos in place (no .item()) instead.
+        for _layer in self.decoder.layers:
+            _kvc = _layer.attn.kv_cache
+            _kvc.cache_pos.copy_(
+                torch.arange(_kvc.cache_pos.numel(), device=_kvc.cache_pos.device)
+            )
         for i in range(1, self.config.audio_num_codebooks):
             curr_decoder_mask = _index_causal_mask(self.decoder_causal_mask, curr_pos)
             decoder_h = self.decoder(self.projection(curr_h), input_pos=curr_pos, mask=curr_decoder_mask).to(
