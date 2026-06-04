@@ -1,0 +1,41 @@
+# Path 1: local RunPod simulator.
+#
+# Mirrors the RunPod serverless wire contract so the same client works locally
+# and on real RunPod. /runsync is buffered (like RunPod); /stream_now is the
+# local-dev streaming path (RunPod /runsync cannot stream).
+#
+#   docker compose -f docker-compose.runpod.yml up --build
+#   curl -s localhost:8000/runsync -H 'content-type: application/json' \
+#     -d '{"input":{"text":"Hello from the simulator.","voice":"default"}}'
+#   # streaming (local only):
+#   curl -N localhost:8000/stream_now -H 'content-type: application/json' \
+#     -d '{"input":{"text":"Streaming test."}}'
+
+services:
+  miso-runpod:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    image: miso-tts:latest
+    command: ["uvicorn", "miso_server.runpod_local:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    environment:
+      - MISO_COMPILE=1          # Linux: enable torch.compile (CUDA graphs)
+      - MISO_TARGET_LUFS=-16.0  # output loudness normalization target
+      - MISO_WARMUP=1
+      - HF_HOME=/workspace/hf
+    volumes:
+      - miso-hf:/workspace/hf            # model + codec + watermarker cache (persist)
+      - ./deploy/prompts:/workspace/prompts  # pre-assigned voice prompts
+    shm_size: "8gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  miso-hf:

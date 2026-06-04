@@ -1,0 +1,34 @@
+# Keep the Docker build context small. The image needs the model code
+# (generator.py, models.py, moshi_compat.py, watermarking.py, pyproject.toml)
+# and deploy/, but not the venv, git history, vendored eval package, or any
+# generated audio / large checkpoints.
+.git
+.venv
+venv
+env
+__pycache__
+*.pyc
+*.pyo
+
+# vendored eval package + harness outputs (not needed to serve)
+perceval/
+perf_eval/baseline/
+perf_eval/runs/
+perf_eval/reports/
+perf_eval/out/
+perf_eval/*.log
+
+# generated audio / checkpoints (model is downloaded at runtime into the cache volume)
+output/
+*.wav
+*.safetensors
+*.pt
+*.ckpt
+
+# local working files
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+PERFORMANCE_ANALYSIS.md
+PERFORMANCE_PROGRESS.md
+TTS_MEASURED_PERFORMANCE.md

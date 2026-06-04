@@ -1,0 +1,9 @@
+# Serving-only dependencies (model deps come from the repo's pyproject in the
+# Dockerfile). Keep numpy < 2 for the torch 2.4.0 ABI.
+fastapi>=0.110
+uvicorn[standard]>=0.29
+runpod>=1.6
+pydantic>=2.0
+soundfile>=0.12
+pyloudnorm>=0.1.1
+numpy<2

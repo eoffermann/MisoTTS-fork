@@ -60,6 +60,10 @@ perf_eval/reports/
 perf_eval/out/
 perf_eval/*.log
 
+# Voice prompt assets (registered at runtime); keep the README only.
+deploy/prompts/*.wav
+deploy/prompts/*.txt
+
 # Claude Code artifacts (anywhere in the tree)
 .claude/
 CLAUDE.md

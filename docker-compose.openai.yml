@@ -1,0 +1,40 @@
+# Path 2: OpenAI-compatible TTS API.
+#
+# Exposes POST /v1/audio/speech with the OpenAI audio-speech request shape, so
+# existing OpenAI TTS clients work by pointing base_url at this server. `voice`
+# selects a pre-assigned MisoTTS voice.
+#
+#   docker compose -f docker-compose.openai.yml up --build
+#   curl -s localhost:8080/v1/audio/speech -H 'content-type: application/json' \
+#     -d '{"model":"miso-tts-8b","input":"Hello world.","voice":"default","response_format":"wav"}' \
+#     --output out.wav
+#   curl -s localhost:8080/v1/audio/voices
+
+services:
+  miso-openai:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    image: miso-tts:latest
+    command: ["uvicorn", "miso_server.openai_api:app", "--host", "0.0.0.0", "--port", "8080"]
+    ports:
+      - "8080:8080"
+    environment:
+      - MISO_COMPILE=1
+      - MISO_TARGET_LUFS=-16.0
+      - MISO_WARMUP=1
+      - HF_HOME=/workspace/hf
+    volumes:
+      - miso-hf:/workspace/hf
+      - ./deploy/prompts:/workspace/prompts
+    shm_size: "8gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  miso-hf:
