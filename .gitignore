@@ -35,12 +35,21 @@ ENV/
 
 # Project specific
 *.wav
+output/
 output_*/
 basic_audio.wav
 full_conversation.wav
 context_audio.wav
+TTS_MEASURED_PERFORMANCE.md
 
 # Model files
 *.pt
 *.ckpt
 *.safetensors
+
+# Claude Code artifacts (anywhere in the tree)
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+.claude.json
+.claude.local.json
