@@ -254,12 +254,16 @@ class Generator:
         chunk: List[torch.Tensor] = []
         all_samples: List[torch.Tensor] = []
         streamed_num_samples = 0
-        pending_final_audio: Optional[torch.Tensor] = None
 
         # Each chunk is computed fully inside torch.inference_mode() and yielded
         # outside it. A plain `with torch.inference_mode():` around the whole
         # generator body would stay active while the generator is suspended at
         # `yield`, silently putting the caller's loop body into inference mode.
+        #
+        # Only full chunk_frames-sized chunks are decoded inside Mimi streaming
+        # mode: on CUDA the streaming decoder is wrapped in a CUDA graph captured
+        # at the first chunk's shape, so a shorter residual chunk would raise a
+        # shape mismatch. The residual is covered by the batch tail decode below.
         with self._audio_tokenizer.streaming(1):
             finished = False
             while not finished:
@@ -282,38 +286,22 @@ class Generator:
                 if out is not None:
                     yield out
 
-            with torch.inference_mode():
-                if chunk:
-                    audio = self._decode_frames(chunk)
-                    streamed_num_samples += audio.size(0)
-                    if audio.numel() > 0:
-                        pending_final_audio = audio
-
-        final_chunks: List[torch.Tensor] = []
+        tail_audio: Optional[torch.Tensor] = None
         with torch.inference_mode():
             if all_samples:
                 # Mimi streaming decode does not expose an explicit flush. Decode
                 # the full code sequence once (in batch mode, outside the streaming
-                # context) and emit only the deferred tail so concatenated stream
-                # chunks keep the batch decode length.
+                # context) and emit only the deferred tail - the residual frames
+                # plus any samples the streamed chunks have not covered - so
+                # concatenated stream chunks keep the batch decode length.
                 full_audio = self._decode_frames(all_samples)
-                tail = None
                 if streamed_num_samples < full_audio.size(0):
                     tail = full_audio[streamed_num_samples:]
+                    if tail.numel() > 0:
+                        tail_audio = self._watermark_stream_chunk(tail, is_final=True)
 
-                if pending_final_audio is not None:
-                    final_chunks.append(
-                        self._watermark_stream_chunk(
-                            pending_final_audio,
-                            is_final=tail is None or tail.numel() == 0,
-                        )
-                    )
-
-                if tail is not None and tail.numel() > 0:
-                    final_chunks.append(self._watermark_stream_chunk(tail, is_final=True))
-
-        for out in final_chunks:
-            yield out
+        if tail_audio is not None:
+            yield tail_audio
 
 
 def _state_dict_from_checkpoint(checkpoint: object) -> dict[str, torch.Tensor]:
