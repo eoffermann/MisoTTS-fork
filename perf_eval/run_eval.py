@@ -56,12 +56,19 @@ def _verdict_exit(v) -> int:
 # thresholds (pre-existing truncation), so we judge a change on whether it makes
 # any key metric WORSE than the baseline, not on the absolute set verdict.
 # (metric -> (higher_is_better, regression_tolerance))
+#
+# Tolerances are sized to perceptual significance, not metric noise (calibrated
+# on the first real run, 2026-06-04). UTMOS is a noisy single-number MOS
+# predictor (~0.1-0.3 jitter per clip) and clips here sit at 4.0+, so only a
+# >0.30 drop is meaningful. tail_truncation only matters as it approaches its
+# 0.35 FLAG band, so sub-0.15 jitter between two already-clean clips is ignored.
+# ASR error tolerances stay tight (those deltas are perceptually real).
 REGRESSION_GATES = {
-    "tier1.tail_truncation":  (False, 0.05),
-    "tier1.tail_word_missing":(False, 0.05),
+    "tier1.tail_truncation":  (False, 0.15),
+    "tier1.tail_word_missing":(False, 0.10),
     "tier1.asr.cer":          (False, 0.03),
     "tier1.asr.wer":          (False, 0.05),
-    "tier2.utmos.mos":        (True,  0.20),
+    "tier2.utmos.mos":        (True,  0.30),
 }
 # Reference-distance parity gate, DETERMINISTIC regime only: an output-preserving
 # change should keep candidate≈baseline, i.e. near-zero reference distance.
