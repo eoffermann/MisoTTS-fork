@@ -1,284 +1,172 @@
 <div align="center">
 
-<img src="images/repo_banner.png" alt="Miso TTS 8B" width="100%">
+# MisoTTS (BigBlueCeiling fork)
 
-# Miso TTS 8B
-
-### State-of-the-Art Text-to-Speech Model
+### An optimization- and deployment-focused fork of MisoTTS
 
 <p>
-  <a href="https://misolabs.ai"><img alt="Website" src="https://img.shields.io/badge/Website-misolabs.ai-black?style=for-the-badge"></a>
-  <a href="https://huggingface.co/MisoLabs/MisoTTS"><img alt="Hugging Face" src="https://img.shields.io/badge/Hugging%20Face-MisoTTS-yellow?style=for-the-badge"></a>
-  <a href="https://github.com/MisoLabsAI"><img alt="GitHub" src="https://img.shields.io/badge/GitHub-MisoLabsAI-181717?style=for-the-badge&logo=github&labelColor=555555"></a>
-  <a href="https://x.com/MisoLabsAI"><img alt="X" src="https://img.shields.io/badge/-MisoLabsAI-181717?style=for-the-badge&logo=x&labelColor=555555"></a>
-</p>
-
-<p>
-  <a href="#quickstart">Quickstart</a> |
-  <a href="#model-introduction">Model Introduction</a> |
-  <a href="#model-summary">Model Summary</a> |
-  <a href="#usage">Usage</a> |
-  <a href="#safety">Safety</a>
+  <a href="https://github.com/MisoLabsAI/MisoTTS"><img alt="Upstream" src="https://img.shields.io/badge/Upstream-MisoLabsAI%2FMisoTTS-181717?style=for-the-badge&logo=github&labelColor=555555"></a>
+  <a href="https://huggingface.co/MisoLabs/MisoTTS"><img alt="Model" src="https://img.shields.io/badge/Model-MisoLabs%2FMisoTTS-yellow?style=for-the-badge"></a>
 </p>
 
 </div>
 
 ---
 
-## Quickstart
+This repository is BigBlueCeiling's fork of [MisoLabsAI/MisoTTS](https://github.com/MisoLabsAI/MisoTTS).
+The model and the original inference code are MisoLabs' work. This fork exists to
+do engineering on top of that: make it fast and correct in practice, and make it
+easy to deploy across a range of hardware. It is not a separate model and not a
+specific product; it is the optimization and deployment substrate.
 
-To quickly try the model, you can use the demo hosted on our [landing page](https://misolabs.ai)
-at misolabs.ai. To try it locally, follow the instructions below.
+## The model (origin)
 
-If you do not have `uv` installed yet:
+MisoTTS is an expressive, English, ~8B-parameter text-to-speech model from
+[MisoLabsAI](https://github.com/MisoLabsAI), inspired by the Sesame CSM
+architecture: a Llama-3.2-style backbone (`llama-8B`) generates Mimi audio codes
+from text and optional audio context, and a smaller autoregressive decoder
+(`llama-300M`) predicts the higher-order codebooks per frame. Output is
+watermarked with SilentCipher. All credit for the model belongs upstream; see
+[MisoLabsAI/MisoTTS](https://github.com/MisoLabsAI/MisoTTS) and the
+[model card](https://huggingface.co/MisoLabs/MisoTTS) for the architecture,
+weights, and the original documentation.
 
-Linux / macOS:
+We track upstream via the `upstream` remote and send general fixes back as pull
+requests (for example the KV-cache device fix, upstream PR #13).
+
+## What this fork is for
+
+Two engineering goals, kept separate from any application we happen to build on
+top of the model:
+
+1. **Optimization.** Fix the bugs that block real use, remove wasted work in the
+   load and generation paths, and unlock the throughput the hardware can actually
+   deliver (torch.compile / CUDA graphs / flash-attention where the platform
+   supports them). On a recent datacenter GPU this takes the model from many
+   times slower than realtime, eager, to near realtime.
+
+2. **Portable, easy deployment.** Run it locally or in the cloud behind a stable
+   API, and match the model to the hardware instead of assuming one reference
+   card. A contributor or a deployment should be able to pick a variant that fits
+   their GPU rather than being locked out by a single fixed precision and memory
+   requirement.
+
+The applications will vary and shift over time. The substrate should stay fast,
+correct, and easy to deploy regardless.
+
+## Issues from upstream we are eliminating
+
+Concrete correctness and efficiency problems we have fixed or are fixing.
+`CHANGES_FROM_MAIN_REPO.md` has the commit-level detail for each.
+
+- **Unusable on GPU out of the box.** KV caches were allocated on the CPU while
+  the model ran on the GPU, aborting generation with a device-mismatch error.
+  Fixed (and submitted upstream).
+- **Clips cut off at the end.** Two causes: generation caps sized for a faster
+  speech rate than the model actually produces, and an end-of-stream decode that
+  dropped the final frame. Fixed, with a perceptual end-truncation gate to keep
+  it fixed.
+- **Wasted startup and per-frame work.** The full 8B model was random-initialized
+  and then immediately overwritten by the checkpoint; a no-op resample ran on
+  every clip; the decoder forced a host sync every frame. Removed.
+- **Unpredictable output loudness.** No loudness normalization, so clips varied by
+  roughly 19 dB with no relation to content. The serving layer normalizes to a
+  target loudness.
+- **No deployment story.** No service, no API, and no way to match the model to
+  the hardware. This fork adds all three.
+
+## Running across a range of hardware
+
+This is an 8B model, so it is not aimed at a 2015-era GPU and never will be. The
+realistic goal is to be a strong, runnable option across a range of reasonably
+recent cards, so that contributors and deployments are not classed out by a
+single hardware requirement. Lowering that floor matters for continued
+development: more people can run it, profile it, and contribute.
+
+The mechanism is selectable, hardware-matched model variants. The serving core
+detects the GPU architecture and selects the best variant that exists, falling
+back to bf16 and logging the gap when it detects a GPU that could use a
+better-but-not-yet-built variant. Variants live in separate Hugging Face repos
+and are pulled at runtime, so the image stays small and weights version
+independently.
+
+| Variant | Precision | Roughly suits | Status |
+|---|---|---|---|
+| `bf16` | bfloat16 weights | ~16-20 GB VRAM, Ampere or newer (RTX 3090/4090, A6000, ...) | available |
+| `int8` / `fp8` weight-only | 8-bit weights, bf16 compute (runs on most recent GPUs) | lighter memory; broad compatibility | evaluating |
+| `fp8` (hardware) | fp8 tensor cores | Ada / Hopper / Blackwell (sm 8.9+) | planned, hardware-gated |
+| `nvfp4` | 4-bit Blackwell FP4 | smallest and fastest, Blackwell only | planned, hardware-gated |
+
+Realistic caveats:
+- Quantized variants trade some quality for memory and throughput. We measure
+  both, with the quality harness below, before recommending one.
+- The biggest throughput wins (CUDA graphs, flash-attention, hardware
+  low-precision) need a modern GPU and a current CUDA stack. Older but supported
+  cards get correctness and bf16, not the fastest paths.
+
+## Quality gating
+
+Optimization is only useful if it does not quietly degrade the audio. Changes are
+validated with `perf_eval/`, a port of a perceptual TTS-evaluation harness that
+scores candidate renders against a baseline (ASR intelligibility, MOS-style
+predictors, reference fidelity, and end-truncation detectors) and gates
+regressions. Every fix above was checked through it before landing.
+
+## Deployment
+
+A Linux/CUDA container serves the model behind two surfaces: a RunPod serverless
+handler (with a local simulator) and an OpenAI-compatible `POST /v1/audio/speech`,
+plus a pre-assignable named-voice registry and output loudness normalization. See
+[`deploy/README.md`](deploy/README.md) for the build, the two compose paths, the
+environment knobs, and the measured performance and cold-start figures.
+
+## Running the model directly
+
+The original local-usage path still works. With `uv`:
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
-Windows (PowerShell):
-
-```powershell
-powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-```
-
-Then clone the repository and create the environment:
-
-Linux / macOS:
-
-```bash
-git clone https://github.com/MisoLabsAI/MisoTTS.git
+git clone https://github.com/eoffermann/MisoTTS.git
 cd MisoTTS
 uv sync --python 3.10
-source .venv/bin/activate
+uv run python run_misotts.py   # writes full_conversation.wav
 ```
 
-Windows (PowerShell):
-
-```powershell
-git clone https://github.com/MisoLabsAI/MisoTTS.git
-cd MisoTTS
-uv sync --python 3.10
-.venv\Scripts\Activate.ps1
-```
-
-Then run the example conversation. By default, `run_misotts.py` loads the public
-model from [MisoLabs/MisoTTS](https://huggingface.co/MisoLabs/MisoTTS) and
-downloads it into the Hugging Face cache if it is not already present on your
-machine:
-
-```bash
-uv run python run_misotts.py
-```
-
-The script writes `full_conversation.wav` in the repository root.
-
-With `pip` instead of `uv`:
-
-Linux / macOS:
-
-```bash
-python3.10 -m venv .venv
-source .venv/bin/activate
-pip install -e .
-python run_misotts.py
-```
-
-Windows (PowerShell):
-
-```powershell
-py -3.10 -m venv .venv
-.venv\Scripts\Activate.ps1
-pip install -e .
-python run_misotts.py
-```
-
-> On Windows, if PowerShell blocks `Activate.ps1`, run
-> `Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned` once,
-> or use `cmd.exe` and `.venv\Scripts\activate.bat` instead.
-
----
-
-## Model Introduction
-
-Miso TTS 8B is a text-to-dialogue RVQ Transformer inspired by the Sesame CSM architecture. It
-generates Mimi audio codes from text and optional audio context, using a large
-Llama 3.2-style backbone and a smaller autoregressive audio decoder. To find out more
-about the architecture, read [our blog post](https://misolabs.ai/blog/miso-tts-8b).
-
-The model is designed for high-quality conversational speech generation.
-This repository contains the inference
-code, model definition, and setup instructions for running Miso TTS locally.
-
-> **Language support:** Miso TTS 8B currently supports **English only**.
-
----
-
-## Model Summary
-
-| Item                | Value           |
-| ------------------- | --------------- |
-| Model               | Miso TTS 8B     |
-| Organization        | Miso Labs       |
-| Task                | Text-to-speech  |
-| Architecture        | RVQ Transformer |
-| Backbone            | `llama-8B`      |
-| Audio decoder       | `llama-300M`    |
-| Text vocabulary     | `128,256`       |
-| Audio vocabulary    | `2,051`         |
-| Audio codebooks     | `32`            |
-| Audio tokenizer     | Mimi            |
-| Max sequence length | `2,048`         |
-| Languages           | English only    |
-
-### Architecture
-
-Miso TTS 8B uses two transformer components:
-
-- A large backbone transformer that consumes text/audio-frame embeddings.
-- A smaller decoder transformer that autoregressively predicts higher-order
-  audio codebooks within each frame.
-
-The backbone accepts interleaved text and audio tokens, allowing it to condition its generations on
-the conversation history.
-
----
-
-## Usage
-
-### Python
+Minimal Python:
 
 ```python
-import torch
-import torchaudio
-
+import torch, torchaudio
 from generator import load_miso_8b
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-
-generator = load_miso_8b(
-    device=device,
-    model_path_or_repo_id="MisoLabs/MisoTTS",
-)
-
-audio = generator.generate(
-    text="Hello from Miso.",
-    speaker=0,
-    context=[],
-    max_audio_length_ms=10_000,
-)
-
-torchaudio.save("miso.wav", audio.unsqueeze(0).cpu(), generator.sample_rate)
+gen = load_miso_8b(device="cuda" if torch.cuda.is_available() else "cpu")
+audio = gen.generate(text="Hello from Miso.", speaker=0, context=[], max_audio_length_ms=10_000)
+torchaudio.save("miso.wav", audio.unsqueeze(0).cpu(), gen.sample_rate)
 ```
 
-### Prompted generation
+`generate()` also takes a `context` of reference `Segment`s for voice prompting,
+and `generate_stream()` yields PCM chunks as frames are produced. See the upstream
+README and the code for the full API.
 
-Miso TTS can condition on prior audio for voice cloning.
-This is optional; the quickstart example above runs without
-prompt audio.
+## Repository layout
 
-```python
-import torchaudio
-
-from generator import Segment, load_miso_8b
-
-generator = load_miso_8b(device="cuda")
-
-prompt_audio, sample_rate = torchaudio.load("prompt.wav")
-prompt_audio = torchaudio.functional.resample(
-    prompt_audio.squeeze(0),
-    orig_freq=sample_rate,
-    new_freq=generator.sample_rate,
-)
-
-context = [
-    Segment(
-        speaker=0,
-        text="This is the transcript for the prompt audio.",
-        audio=prompt_audio,
-    )
-]
-
-audio = generator.generate(
-    text="This is the next sentence to synthesize.",
-    speaker=0,
-    context=context,
-    max_audio_length_ms=10_000,
-)
-```
-
-### Streaming generation
-
-Use `generate_stream()` to receive PCM chunks while frames are still being
-generated. The default `chunk_frames=25` yields about two seconds of 24 kHz
-audio per chunk.
-Chunks are watermarked independently; if SilentCipher rejects a very short
-terminal fragment, that fragment is yielded unchanged.
-
-```python
-import torch
-
-from generator import load_miso_8b
-
-generator = load_miso_8b(device="cuda")
-
-chunks = []
-for chunk in generator.generate_stream(
-    text="This sentence is decoded in chunks.",
-    speaker=0,
-    context=[],
-    max_audio_length_ms=10_000,
-    chunk_frames=25,
-):
-    chunks.append(chunk.cpu())
-
-audio = torch.cat(chunks, dim=0)
-```
-
----
-
-## Weights
-
-The model weights are hosted publicly on Hugging Face:
-
-```bash
-uv run python run_misotts.py
-```
-
-The default model repository is
-[MisoLabs/MisoTTS](https://huggingface.co/MisoLabs/MisoTTS). The first run
-downloads the model automatically through Hugging Face Hub; later runs reuse the
-cached copy.
-
-The first run also downloads the SilentCipher watermarking model from
-`sony/silentcipher`. If that separate download times out, rerun the command; the
-Hugging Face cache resumes from files that already completed.
-
----
-
-## Deployment Notes
-
-Miso TTS 8B is a large model. For best results, use a CUDA GPU with sufficient
-VRAM for the checkpoint precision you are loading. The default inference path
-uses `torch.bfloat16`.
-
----
+- `generator.py`, `models.py`, `moshi_compat.py`, `watermarking.py` - the model
+  and inference code (from upstream, with our fixes).
+- `deploy/` - the serving container, the RunPod and OpenAI surfaces, GPU-sense and
+  variant tooling.
+- `perf_eval/` - the quality and performance evaluation harness.
+- `profile_misotts.py` - the batch + streaming benchmark.
+- `CHANGES_FROM_MAIN_REPO.md` - every divergence from upstream, with the problem
+  and the commit that addresses it.
 
 ## Safety
 
-Miso TTS is a speech generation model. Do not use it to impersonate people,
-create deceptive audio, commit fraud, or generate harmful content.
+MisoTTS is a speech-generation model. Do not use it to impersonate people, create
+deceptive audio, commit fraud, or generate harmful content. Generated audio is
+watermarked by default; if you deploy the model, use your own private watermark
+key and keep it secret.
 
-Generated audio is watermarked by default. If you deploy this model in another
-application, use your own private watermark key and keep it secret.
+## License and credit
 
----
-
-## Links
-
-- Website: [misolabs.ai](https://misolabs.ai)
-- Hugging Face: [MisoLabs/MisoTTS](https://huggingface.co/MisoLabs/MisoTTS)
-- GitHub: [MisoLabsAI](https://github.com/MisoLabsAI)
-- X: [@MisoLabsAI](https://x.com/MisoLabsAI)
+The model and the original inference code are MisoLabs' work, under the upstream
+license. This fork preserves that and adds engineering on top. Use of the model
+is subject to the upstream license; see
+[MisoLabsAI/MisoTTS](https://github.com/MisoLabsAI/MisoTTS).
