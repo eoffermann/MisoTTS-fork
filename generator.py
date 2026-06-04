@@ -198,7 +198,11 @@ class Generator:
         # This applies an imperceptible watermark to identify audio as AI-generated.
         # If using Miso TTS in another application, use your own private key and keep it secret.
         audio, wm_sample_rate = watermark(self._watermarker, audio, self.sample_rate, MISO_TTS_WATERMARK)
-        audio = torchaudio.functional.resample(audio, orig_freq=wm_sample_rate, new_freq=self.sample_rate)
+        # watermark() returns audio at min(44100, self.sample_rate) Hz, which
+        # equals self.sample_rate (24k) -- so this was a no-op polyphase resample
+        # over the whole clip on every call. Guard it; only resample if needed.
+        if wm_sample_rate != self.sample_rate:
+            audio = torchaudio.functional.resample(audio, orig_freq=wm_sample_rate, new_freq=self.sample_rate)
         return audio
 
     def _watermark_stream_chunk(self, audio: torch.Tensor, *, is_final: bool) -> torch.Tensor:
