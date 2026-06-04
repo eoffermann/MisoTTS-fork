@@ -1,3 +1,4 @@
+import contextlib
 from dataclasses import dataclass
 import os
 from typing import Iterator, List, Optional, Tuple
@@ -358,6 +359,38 @@ def _state_dict_from_checkpoint(checkpoint: object) -> dict[str, torch.Tensor]:
     return state_dict
 
 
+@contextlib.contextmanager
+def _skip_random_init():
+    """Skip torch.nn.init random fills during model construction.
+
+    Model(config) builds the full ~8B-param stack and random-initializes every
+    weight (kaiming/normal over billions of elements on the CPU), but those
+    values are overwritten a moment later by load_state_dict from the checkpoint
+    -- pure wasted startup time. Patch the nn.init fills to no-ops during
+    construction. The tensors are still allocated; only the random fill is
+    skipped. RoPE caches and other computed buffers do NOT use nn.init, so they
+    are built normally; load_state_dict (strict) still guarantees every param is
+    populated from the checkpoint.
+    """
+    import torch.nn.init as I
+    names = ["kaiming_uniform_", "kaiming_normal_", "normal_", "uniform_",
+             "xavier_uniform_", "xavier_normal_", "trunc_normal_"]
+    saved = {}
+
+    def _noop(tensor, *a, **k):
+        return tensor
+
+    for n in names:
+        if hasattr(I, n):
+            saved[n] = getattr(I, n)
+            setattr(I, n, _noop)
+    try:
+        yield
+    finally:
+        for n, fn in saved.items():
+            setattr(I, n, fn)
+
+
 def _load_model(
     model_path_or_repo_id: str,
     config: ModelArgs,
@@ -372,7 +405,8 @@ def _load_model(
         model_file = hf_hub_download(repo_id=model_path_or_repo_id, filename="model.safetensors")
 
     if os.path.isfile(model_file):
-        model = Model(config)
+        with _skip_random_init():
+            model = Model(config)
         if model_file.endswith(".safetensors"):
             try:
                 from safetensors.torch import load_file
