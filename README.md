@@ -32,17 +32,36 @@ at misolabs.ai. To try it locally, follow the instructions below.
 
 If you do not have `uv` installed yet:
 
+Linux / macOS:
+
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
+Windows (PowerShell):
+
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
 Then clone the repository and create the environment:
+
+Linux / macOS:
 
 ```bash
 git clone https://github.com/MisoLabsAI/MisoTTS.git
 cd MisoTTS
 uv sync --python 3.10
 source .venv/bin/activate
+```
+
+Windows (PowerShell):
+
+```powershell
+git clone https://github.com/MisoLabsAI/MisoTTS.git
+cd MisoTTS
+uv sync --python 3.10
+.venv\Scripts\Activate.ps1
 ```
 
 Then run the example conversation. By default, `run_misotts.py` loads the public
@@ -58,12 +77,27 @@ The script writes `full_conversation.wav` in the repository root.
 
 With `pip` instead of `uv`:
 
+Linux / macOS:
+
 ```bash
 python3.10 -m venv .venv
 source .venv/bin/activate
 pip install -e .
 python run_misotts.py
 ```
+
+Windows (PowerShell):
+
+```powershell
+py -3.10 -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -e .
+python run_misotts.py
+```
+
+> On Windows, if PowerShell blocks `Activate.ps1`, run
+> `Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned` once,
+> or use `cmd.exe` and `.venv\Scripts\activate.bat` instead.
 
 ---
 
