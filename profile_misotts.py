@@ -8,10 +8,31 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+# Wall-clock anchor so every log line shows elapsed time since the process
+# started — handy for spotting where the long stalls actually are.
+_START = time.perf_counter()
+
+
+def log(msg: str) -> None:
+    """Timestamped, flushed progress line.
+
+    flush=True matters: on Windows, piped/redirected stdout is block-buffered,
+    so without it these messages wouldn't appear until a buffer fills — exactly
+    the "is it locked up?" silence we're trying to kill.
+    """
+    print(f"[{time.perf_counter() - _START:7.1f}s] {msg}", flush=True)
+
+
+log("Starting profiler. Importing torch (this pulls in CUDA libs, ~10-30s cold)...")
 import torch
+
+log(f"torch {torch.__version__} imported. Importing torchaudio...")
 import torchaudio  # type: ignore
 
+log("torchaudio imported. Importing generator (load_miso_8b)...")
 from generator import DEFAULT_MISO_TTS_REPO_ID, load_miso_8b
+
+log("Imports complete.")
 
 
 # Each entry: target audio length in seconds + a generous cap (max_audio_length_ms)
@@ -123,6 +144,9 @@ PROMPTS = {
 }
 
 
+STREAM_CHUNK_FRAMES = 25  # ~2 s of 24 kHz audio per chunk; matches README default
+
+
 def synchronize(device: str) -> None:
     if device == "cuda":
         torch.cuda.synchronize()
@@ -133,63 +157,99 @@ def _md_escape(text: str) -> str:
     return text.replace("|", "\\|").replace("\n", " ").strip()
 
 
-def _stats(rows):
+def _stats(rows, fields=("wall_s", "audio_s", "rtf")):
     n = len(rows)
     if n == 0:
         return {"n": 0}
-    walls = [r["wall_s"] for r in rows]
-    audios = [r["audio_s"] for r in rows]
-    rtfs = [r["rtf"] for r in rows]
-    return {
-        "n": n,
-        "avg_wall": sum(walls) / n,
-        "avg_audio": sum(audios) / n,
-        "avg_rtf": sum(rtfs) / n,
-        "min_rtf": min(rtfs),
-        "max_rtf": max(rtfs),
-        "total_wall": sum(walls),
-        "total_audio": sum(audios),
-    }
+    out = {"n": n}
+    for f in fields:
+        vals = [r[f] for r in rows]
+        out[f"avg_{f}"] = sum(vals) / n
+        out[f"min_{f}"] = min(vals)
+        out[f"max_{f}"] = max(vals)
+        out[f"total_{f}"] = sum(vals)
+    return out
 
 
-def write_markdown_report(
-    md_path: Path,
-    results: list,
-    env: dict,
-) -> None:
-    lines: list[str] = []
-    lines.append("# Miso TTS 8B — Measured Performance")
-    lines.append("")
-    lines.append(f"- **Generated:** {env['timestamp']}")
-    lines.append(f"- **Device:** {env['device']}" + (f" ({env['device_name']})" if env.get("device_name") else ""))
-    lines.append(f"- **Torch:** {env['torch_version']} · **dtype:** {env['dtype']}")
-    lines.append(f"- **Sample rate:** {env['sample_rate']} Hz")
-    lines.append(f"- **Model:** {env['model_source']}")
-    lines.append("")
-    lines.append(
-        "RTF = wall-clock seconds ÷ generated audio seconds. "
-        "RTF < 1.0 means faster than realtime; lower is better."
+def run_batch_clip(generator, text, length_label, emotion, idx, max_ms,
+                   sample_rate, device, out_dir):
+    synchronize(device)
+    t0 = time.perf_counter()
+    audio = generator.generate(
+        text=text, speaker=0, context=[], max_audio_length_ms=max_ms,
     )
-    lines.append("")
+    synchronize(device)
+    t1 = time.perf_counter()
 
-    section_titles = {
-        "short": "Short clips (target ~5 s)",
-        "medium": "Medium clips (target ~10 s)",
-        "long": "Long clips (target ~15 s)",
+    wall_s = t1 - t0
+    audio_s = audio.shape[0] / sample_rate
+    rtf = wall_s / audio_s if audio_s > 0 else float("inf")
+
+    filename = f"{length_label}_{emotion}_{idx:02d}.wav"
+    torchaudio.save(str(out_dir / filename), audio.unsqueeze(0).cpu(), sample_rate)
+
+    return {
+        "length": length_label, "emotion": emotion, "index": idx, "text": text,
+        "wall_s": wall_s, "audio_s": audio_s, "rtf": rtf, "filename": filename,
     }
 
-    for length_label in ("short", "medium", "long"):
-        rows = [r for r in results if r["length"] == length_label]
-        if not rows:
-            continue
-        lines.append(f"## {section_titles[length_label]}")
-        lines.append("")
-        lines.append(
-            "| # | Emotion | File | Wall (s) | Audio (s) | RTF | Text |"
-        )
-        lines.append(
-            "|---|---------|------|---------:|----------:|----:|------|"
-        )
+
+def run_stream_clip(generator, text, length_label, emotion, idx, max_ms,
+                    sample_rate, device, out_dir):
+    synchronize(device)
+    t0 = time.perf_counter()
+    ttfb_s = None
+    chunks = []
+    for chunk in generator.generate_stream(
+        text=text, speaker=0, context=[], max_audio_length_ms=max_ms,
+        chunk_frames=STREAM_CHUNK_FRAMES,
+    ):
+        if ttfb_s is None:
+            synchronize(device)
+            ttfb_s = time.perf_counter() - t0
+        chunks.append(chunk.cpu())
+    synchronize(device)
+    t1 = time.perf_counter()
+
+    wall_s = t1 - t0
+    if chunks:
+        audio = torch.cat(chunks, dim=0)
+    else:
+        audio = torch.zeros(0)
+    audio_s = audio.shape[0] / sample_rate
+    rtf = wall_s / audio_s if audio_s > 0 else float("inf")
+    # If no chunk was yielded, ttfb is undefined; report total wall as a stand-in.
+    if ttfb_s is None:
+        ttfb_s = wall_s
+
+    filename = f"{length_label}_{emotion}_{idx:02d}_stream.wav"
+    torchaudio.save(str(out_dir / filename), audio.unsqueeze(0), sample_rate)
+
+    return {
+        "length": length_label, "emotion": emotion, "index": idx, "text": text,
+        "ttfb_s": ttfb_s, "wall_s": wall_s, "audio_s": audio_s, "rtf": rtf,
+        "filename": filename,
+    }
+
+
+def _render_clip_table(lines, rows, include_ttfb):
+    if include_ttfb:
+        lines.append("| # | Emotion | File | TTFB (s) | Wall (s) | Audio (s) | RTF | Text |")
+        lines.append("|---|---------|------|---------:|---------:|----------:|----:|------|")
+        for r in rows:
+            lines.append(
+                f"| {r['index']:02d} "
+                f"| {r['emotion']} "
+                f"| `{r['filename']}` "
+                f"| {r['ttfb_s']:.2f} "
+                f"| {r['wall_s']:.2f} "
+                f"| {r['audio_s']:.2f} "
+                f"| {r['rtf']:.2f} "
+                f"| {_md_escape(r['text'])} |"
+            )
+    else:
+        lines.append("| # | Emotion | File | Wall (s) | Audio (s) | RTF | Text |")
+        lines.append("|---|---------|------|---------:|----------:|----:|------|")
         for r in rows:
             lines.append(
                 f"| {r['index']:02d} "
@@ -200,54 +260,200 @@ def write_markdown_report(
                 f"| {r['rtf']:.2f} "
                 f"| {_md_escape(r['text'])} |"
             )
-        lines.append("")
 
-        s = _stats(rows)
-        lines.append(f"**{section_titles[length_label]} — summary**")
-        lines.append("")
-        lines.append("| Metric | Value |")
-        lines.append("|--------|------:|")
-        lines.append(f"| Clips | {s['n']} |")
-        lines.append(f"| Avg wall time | {s['avg_wall']:.2f} s |")
-        lines.append(f"| Avg audio length | {s['avg_audio']:.2f} s |")
-        lines.append(f"| Avg RTF | {s['avg_rtf']:.2f} |")
-        lines.append(f"| Min RTF (fastest) | {s['min_rtf']:.2f} |")
-        lines.append(f"| Max RTF (slowest) | {s['max_rtf']:.2f} |")
-        lines.append(f"| Total wall time | {s['total_wall']:.2f} s |")
-        lines.append(f"| Total audio generated | {s['total_audio']:.2f} s |")
-        lines.append("")
 
-    # Totals: side-by-side comparison + overall.
-    lines.append("## Totals")
+def _render_section_summary(lines, rows, include_ttfb, title):
+    fields = ("wall_s", "audio_s", "rtf") + (("ttfb_s",) if include_ttfb else ())
+    s = _stats(rows, fields=fields)
+    lines.append(f"**{title} — summary**")
     lines.append("")
-    lines.append(
-        "| Length | N | Avg Wall (s) | Avg Audio (s) | Avg RTF | "
-        "Min RTF | Max RTF | Total Wall (s) | Total Audio (s) |"
-    )
-    lines.append(
-        "|--------|--:|-------------:|--------------:|--------:|"
-        "--------:|--------:|---------------:|----------------:|"
-    )
+    lines.append("| Metric | Value |")
+    lines.append("|--------|------:|")
+    lines.append(f"| Clips | {s['n']} |")
+    if include_ttfb:
+        lines.append(f"| Avg TTFB | {s['avg_ttfb_s']:.2f} s |")
+        lines.append(f"| Min TTFB (fastest first chunk) | {s['min_ttfb_s']:.2f} s |")
+        lines.append(f"| Max TTFB | {s['max_ttfb_s']:.2f} s |")
+    lines.append(f"| Avg wall time | {s['avg_wall_s']:.2f} s |")
+    lines.append(f"| Avg audio length | {s['avg_audio_s']:.2f} s |")
+    lines.append(f"| Avg RTF | {s['avg_rtf']:.2f} |")
+    lines.append(f"| Min RTF (fastest) | {s['min_rtf']:.2f} |")
+    lines.append(f"| Max RTF (slowest) | {s['max_rtf']:.2f} |")
+    lines.append(f"| Total wall time | {s['total_wall_s']:.2f} s |")
+    lines.append(f"| Total audio generated | {s['total_audio_s']:.2f} s |")
+    lines.append("")
+
+
+def _render_totals_table(lines, results, include_ttfb):
+    if include_ttfb:
+        lines.append(
+            "| Length | N | Avg TTFB (s) | Avg Wall (s) | Avg Audio (s) | "
+            "Avg RTF | Min RTF | Max RTF | Total Wall (s) | Total Audio (s) |"
+        )
+        lines.append(
+            "|--------|--:|-------------:|-------------:|--------------:|"
+            "--------:|--------:|--------:|---------------:|----------------:|"
+        )
+    else:
+        lines.append(
+            "| Length | N | Avg Wall (s) | Avg Audio (s) | Avg RTF | "
+            "Min RTF | Max RTF | Total Wall (s) | Total Audio (s) |"
+        )
+        lines.append(
+            "|--------|--:|-------------:|--------------:|--------:|"
+            "--------:|--------:|---------------:|----------------:|"
+        )
+    fields = ("wall_s", "audio_s", "rtf") + (("ttfb_s",) if include_ttfb else ())
     for length_label in ("short", "medium", "long"):
         rows = [r for r in results if r["length"] == length_label]
         if not rows:
             continue
-        s = _stats(rows)
+        s = _stats(rows, fields=fields)
+        if include_ttfb:
+            lines.append(
+                f"| {length_label} | {s['n']} | {s['avg_ttfb_s']:.2f} "
+                f"| {s['avg_wall_s']:.2f} | {s['avg_audio_s']:.2f} | {s['avg_rtf']:.2f} "
+                f"| {s['min_rtf']:.2f} | {s['max_rtf']:.2f} "
+                f"| {s['total_wall_s']:.2f} | {s['total_audio_s']:.2f} |"
+            )
+        else:
+            lines.append(
+                f"| {length_label} | {s['n']} "
+                f"| {s['avg_wall_s']:.2f} | {s['avg_audio_s']:.2f} | {s['avg_rtf']:.2f} "
+                f"| {s['min_rtf']:.2f} | {s['max_rtf']:.2f} "
+                f"| {s['total_wall_s']:.2f} | {s['total_audio_s']:.2f} |"
+            )
+    overall = _stats(results, fields=fields)
+    if include_ttfb:
         lines.append(
-            f"| {length_label} | {s['n']} "
-            f"| {s['avg_wall']:.2f} | {s['avg_audio']:.2f} | {s['avg_rtf']:.2f} "
-            f"| {s['min_rtf']:.2f} | {s['max_rtf']:.2f} "
-            f"| {s['total_wall']:.2f} | {s['total_audio']:.2f} |"
+            f"| **overall** | **{overall['n']}** | **{overall['avg_ttfb_s']:.2f}** "
+            f"| **{overall['avg_wall_s']:.2f}** | **{overall['avg_audio_s']:.2f}** "
+            f"| **{overall['avg_rtf']:.2f}** "
+            f"| **{overall['min_rtf']:.2f}** | **{overall['max_rtf']:.2f}** "
+            f"| **{overall['total_wall_s']:.2f}** | **{overall['total_audio_s']:.2f}** |"
         )
-    overall = _stats(results)
+    else:
+        lines.append(
+            f"| **overall** | **{overall['n']}** "
+            f"| **{overall['avg_wall_s']:.2f}** | **{overall['avg_audio_s']:.2f}** "
+            f"| **{overall['avg_rtf']:.2f}** "
+            f"| **{overall['min_rtf']:.2f}** | **{overall['max_rtf']:.2f}** "
+            f"| **{overall['total_wall_s']:.2f}** | **{overall['total_audio_s']:.2f}** |"
+        )
+
+
+def write_markdown_report(
+    md_path: Path,
+    batch_results: list,
+    stream_results: list,
+    env: dict,
+) -> None:
+    lines: list[str] = []
+    lines.append("# Miso TTS 8B — Measured Performance")
+    lines.append("")
+    lines.append(f"- **Generated:** {env['timestamp']}")
+    lines.append(f"- **Device:** {env['device']}" + (f" ({env['device_name']})" if env.get("device_name") else ""))
+    lines.append(f"- **Torch:** {env['torch_version']} · **dtype:** {env['dtype']}")
+    lines.append(f"- **Sample rate:** {env['sample_rate']} Hz")
+    lines.append(f"- **Model:** {env['model_source']}")
+    lines.append(f"- **Stream chunk_frames:** {STREAM_CHUNK_FRAMES} (~{STREAM_CHUNK_FRAMES * 0.08:.1f} s/chunk)")
+    lines.append("")
     lines.append(
-        f"| **overall** | **{overall['n']}** "
-        f"| **{overall['avg_wall']:.2f}** | **{overall['avg_audio']:.2f}** "
-        f"| **{overall['avg_rtf']:.2f}** "
-        f"| **{overall['min_rtf']:.2f}** | **{overall['max_rtf']:.2f}** "
-        f"| **{overall['total_wall']:.2f}** | **{overall['total_audio']:.2f}** |"
+        "RTF = wall-clock seconds ÷ generated audio seconds. "
+        "RTF < 1.0 means faster than realtime; lower is better. "
+        "TTFB = wall-clock seconds from `generate_stream()` call until the first audio chunk is ready."
     )
     lines.append("")
+
+    section_titles = {
+        "short": "Short clips (target ~5 s)",
+        "medium": "Medium clips (target ~10 s)",
+        "long": "Long clips (target ~15 s)",
+    }
+
+    # ----- Batch section -----
+    lines.append("# Batch (non-streaming) — `generator.generate()`")
+    lines.append("")
+    for length_label in ("short", "medium", "long"):
+        rows = [r for r in batch_results if r["length"] == length_label]
+        if not rows:
+            continue
+        lines.append(f"## {section_titles[length_label]}")
+        lines.append("")
+        _render_clip_table(lines, rows, include_ttfb=False)
+        lines.append("")
+        _render_section_summary(lines, rows, include_ttfb=False,
+                                title=section_titles[length_label])
+
+    lines.append("## Batch totals")
+    lines.append("")
+    _render_totals_table(lines, batch_results, include_ttfb=False)
+    lines.append("")
+
+    # ----- Streaming section -----
+    if stream_results:
+        lines.append(f"# Streaming — `generator.generate_stream(chunk_frames={STREAM_CHUNK_FRAMES})`")
+        lines.append("")
+        for length_label in ("short", "medium", "long"):
+            rows = [r for r in stream_results if r["length"] == length_label]
+            if not rows:
+                continue
+            lines.append(f"## {section_titles[length_label]} (streaming)")
+            lines.append("")
+            _render_clip_table(lines, rows, include_ttfb=True)
+            lines.append("")
+            _render_section_summary(lines, rows, include_ttfb=True,
+                                    title=section_titles[length_label] + " (streaming)")
+
+        lines.append("## Streaming totals")
+        lines.append("")
+        _render_totals_table(lines, stream_results, include_ttfb=True)
+        lines.append("")
+
+        # ----- Batch vs streaming comparison -----
+        lines.append("# Batch vs streaming comparison")
+        lines.append("")
+        lines.append(
+            "| Length | N | Batch Avg Wall (s) | Stream Avg Wall (s) | "
+            "Stream Avg TTFB (s) | Batch Avg RTF | Stream Avg RTF |"
+        )
+        lines.append(
+            "|--------|--:|-------------------:|--------------------:|"
+            "--------------------:|--------------:|---------------:|"
+        )
+
+        def _fmt(stats, key, fmt=".2f"):
+            return f"{stats[key]:{fmt}}" if stats else "–"
+
+        for length_label in ("short", "medium", "long"):
+            b = [r for r in batch_results if r["length"] == length_label]
+            s = [r for r in stream_results if r["length"] == length_label]
+            n_show = max(len(b), len(s))
+            if n_show == 0:
+                continue
+            bs = _stats(b) if b else None
+            ss = _stats(s, fields=("wall_s", "audio_s", "rtf", "ttfb_s")) if s else None
+            lines.append(
+                f"| {length_label} | {n_show} "
+                f"| {_fmt(bs, 'avg_wall_s')} "
+                f"| {_fmt(ss, 'avg_wall_s')} "
+                f"| {_fmt(ss, 'avg_ttfb_s')} "
+                f"| {_fmt(bs, 'avg_rtf')} "
+                f"| {_fmt(ss, 'avg_rtf')} |"
+            )
+
+        bs_all = _stats(batch_results) if batch_results else None
+        ss_all = _stats(stream_results, fields=("wall_s", "audio_s", "rtf", "ttfb_s")) if stream_results else None
+        n_all = max(len(batch_results), len(stream_results))
+        lines.append(
+            f"| **overall** | **{n_all}** "
+            f"| **{_fmt(bs_all, 'avg_wall_s')}** "
+            f"| **{_fmt(ss_all, 'avg_wall_s')}** "
+            f"| **{_fmt(ss_all, 'avg_ttfb_s')}** "
+            f"| **{_fmt(bs_all, 'avg_rtf')}** "
+            f"| **{_fmt(ss_all, 'avg_rtf')}** |"
+        )
+        lines.append("")
 
     md_path.write_text("\n".join(lines), encoding="utf-8")
 
@@ -257,30 +463,44 @@ def main():
         device = "cuda"
     else:
         device = "cpu"
-    print(f"Using device: {device}")
+    log(f"Using device: {device}")
 
     device_name = torch.cuda.get_device_name(0) if device == "cuda" else None
+    if device_name:
+        log(f"GPU: {device_name}")
     model_source = os.environ.get("MISO_TTS_8B_MODEL", DEFAULT_MISO_TTS_REPO_ID)
-    print(f"Loading model from: {model_source}")
+    log(f"Loading model from: {model_source}")
+    log("  (this maps the ~32 GB checkpoint into memory — expect a long pause here)")
+    t_load = time.perf_counter()
     generator = load_miso_8b(device, model_path_or_repo_id=model_source)
+    log(f"Model loaded in {time.perf_counter() - t_load:.1f}s.")
     sample_rate = generator.sample_rate
     model_dtype = next(generator._model.parameters()).dtype
 
     out_dir = Path("output")
     out_dir.mkdir(exist_ok=True)
 
-    # Warm-up run so first-iteration kernel compilation / cudnn tuning does not
-    # skew the first measured clip.
-    print("Warming up...")
+    # Warm-up: batch path (kernel compile / cudnn tuning), then streaming path
+    # (Mimi streaming captures a CUDA graph at the first full chunk's shape).
+    log("Warming up batch path...")
     _ = generator.generate(
-        text="Warming up the model.",
-        speaker=0,
-        context=[],
+        text="Warming up the model.", speaker=0, context=[],
         max_audio_length_ms=4_000,
     )
     synchronize(device)
 
-    results = []  # one dict per clip
+    log(f"Warming up streaming path (chunk_frames={STREAM_CHUNK_FRAMES})...")
+    for _chunk in generator.generate_stream(
+        text="Warming up the streaming path with a slightly longer prompt.",
+        speaker=0, context=[], max_audio_length_ms=6_000,
+        chunk_frames=STREAM_CHUNK_FRAMES,
+    ):
+        pass
+    synchronize(device)
+    log("Warm-up complete. Starting timed runs (60 batch + 60 streaming clips)...")
+
+    batch_results = []
+    stream_results = []
 
     for length_label, cfg in PROMPTS.items():
         max_ms = cfg["max_ms"]
@@ -291,97 +511,90 @@ def main():
         )
         for emotion, sentences in cfg["by_emotion"].items():
             for idx, text in enumerate(sentences, start=1):
-                synchronize(device)
-                t0 = time.perf_counter()
-                audio = generator.generate(
-                    text=text,
-                    speaker=0,
-                    context=[],
-                    max_audio_length_ms=max_ms,
+                br = run_batch_clip(
+                    generator, text, length_label, emotion, idx, max_ms,
+                    sample_rate, device, out_dir,
                 )
-                synchronize(device)
-                t1 = time.perf_counter()
-
-                wall_s = t1 - t0
-                audio_s = audio.shape[0] / sample_rate
-                rtf = wall_s / audio_s if audio_s > 0 else float("inf")
-
-                filename = f"{length_label}_{emotion}_{idx:02d}.wav"
-                fpath = out_dir / filename
-                torchaudio.save(
-                    str(fpath),
-                    audio.unsqueeze(0).cpu(),
-                    sample_rate,
-                )
-
+                batch_results.append(br)
                 print(
-                    f"  [{length_label}/{emotion}/{idx:02d}] "
-                    f"wall={wall_s:6.2f}s  audio={audio_s:5.2f}s  "
-                    f"RTF={rtf:5.2f}  -> {filename}"
-                )
-                results.append(
-                    {
-                        "length": length_label,
-                        "emotion": emotion,
-                        "index": idx,
-                        "text": text,
-                        "wall_s": wall_s,
-                        "audio_s": audio_s,
-                        "rtf": rtf,
-                        "filename": filename,
-                    }
+                    f"  [{length_label}/{emotion}/{idx:02d}] batch  "
+                    f"wall={br['wall_s']:6.2f}s  audio={br['audio_s']:5.2f}s  "
+                    f"RTF={br['rtf']:5.2f}  -> {br['filename']}"
                 )
 
-    # Per-clip detail table.
-    print("\n" + "=" * 78)
-    print("Per-clip results")
-    print("=" * 78)
-    print(f"{'File':34}  {'Wall (s)':>9}  {'Audio (s)':>10}  {'RTF':>6}")
-    print("-" * 78)
-    for r in results:
-        print(
-            f"{r['filename']:34}  {r['wall_s']:9.2f}  "
-            f"{r['audio_s']:10.2f}  {r['rtf']:6.2f}"
-        )
+                sr = run_stream_clip(
+                    generator, text, length_label, emotion, idx, max_ms,
+                    sample_rate, device, out_dir,
+                )
+                stream_results.append(sr)
+                print(
+                    f"  [{length_label}/{emotion}/{idx:02d}] stream "
+                    f"ttfb={sr['ttfb_s']:5.2f}s  wall={sr['wall_s']:6.2f}s  "
+                    f"audio={sr['audio_s']:5.2f}s  RTF={sr['rtf']:5.2f}  "
+                    f"-> {sr['filename']}"
+                )
 
-    # Aggregate table by length category.
-    print("\n" + "=" * 78)
-    print("Average performance per length category")
-    print("=" * 78)
-    print(
-        f"{'Length':10}  {'N':>3}  {'Avg Wall (s)':>14}  "
-        f"{'Avg Audio (s)':>15}  {'Avg RTF':>9}"
-    )
-    print("-" * 78)
-    for length_label in PROMPTS.keys():
-        rows = [r for r in results if r["length"] == length_label]
-        n = len(rows)
-        avg_wall = sum(r["wall_s"] for r in rows) / n
-        avg_audio = sum(r["audio_s"] for r in rows) / n
-        avg_rtf = sum(r["rtf"] for r in rows) / n
-        print(
-            f"{length_label:10}  {n:3d}  {avg_wall:14.2f}  "
-            f"{avg_audio:15.2f}  {avg_rtf:9.2f}"
+    # Console summary tables (batch then streaming).
+    def _print_avg_table(rows, label, include_ttfb):
+        print("\n" + "=" * 78)
+        print(f"Average performance per length category — {label}")
+        print("=" * 78)
+        header = (
+            f"{'Length':10}  {'N':>3}  "
+            + (f"{'Avg TTFB':>9}  " if include_ttfb else "")
+            + f"{'Avg Wall':>9}  {'Avg Audio':>10}  {'Avg RTF':>9}"
         )
+        print(header)
+        print("-" * 78)
+        for length_label in PROMPTS.keys():
+            ls = [r for r in rows if r["length"] == length_label]
+            if not ls:
+                continue
+            n = len(ls)
+            avg_wall = sum(r["wall_s"] for r in ls) / n
+            avg_audio = sum(r["audio_s"] for r in ls) / n
+            avg_rtf = sum(r["rtf"] for r in ls) / n
+            line = f"{length_label:10}  {n:3d}  "
+            if include_ttfb:
+                avg_ttfb = sum(r["ttfb_s"] for r in ls) / n
+                line += f"{avg_ttfb:9.2f}  "
+            line += f"{avg_wall:9.2f}  {avg_audio:10.2f}  {avg_rtf:9.2f}"
+            print(line)
 
-    # CSV dump for later analysis.
-    csv_path = out_dir / "profile_results.csv"
-    with open(csv_path, "w", encoding="utf-8") as f:
+    _print_avg_table(batch_results, "batch", include_ttfb=False)
+    _print_avg_table(stream_results, "streaming", include_ttfb=True)
+
+    # CSV dumps (one per mode).
+    batch_csv = out_dir / "profile_results_batch.csv"
+    with open(batch_csv, "w", encoding="utf-8") as f:
         f.write("length,emotion,index,wall_s,audio_s,rtf,filename,text\n")
-        for r in results:
+        for r in batch_results:
             safe_text = r["text"].replace('"', '""')
             f.write(
                 f"{r['length']},{r['emotion']},{r['index']},"
                 f"{r['wall_s']:.4f},{r['audio_s']:.4f},{r['rtf']:.4f},"
                 f"{r['filename']},\"{safe_text}\"\n"
             )
-    print(f"\nWrote per-clip CSV to {csv_path}")
+    print(f"\nWrote batch CSV to {batch_csv}")
+
+    stream_csv = out_dir / "profile_results_stream.csv"
+    with open(stream_csv, "w", encoding="utf-8") as f:
+        f.write("length,emotion,index,ttfb_s,wall_s,audio_s,rtf,filename,text\n")
+        for r in stream_results:
+            safe_text = r["text"].replace('"', '""')
+            f.write(
+                f"{r['length']},{r['emotion']},{r['index']},"
+                f"{r['ttfb_s']:.4f},{r['wall_s']:.4f},{r['audio_s']:.4f},"
+                f"{r['rtf']:.4f},{r['filename']},\"{safe_text}\"\n"
+            )
+    print(f"Wrote streaming CSV to {stream_csv}")
 
     # Markdown report alongside the script for easy reading.
     md_path = Path("TTS_MEASURED_PERFORMANCE.md")
     write_markdown_report(
         md_path,
-        results,
+        batch_results,
+        stream_results,
         env={
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "device": device,
