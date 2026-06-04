@@ -47,6 +47,19 @@ TTS_MEASURED_PERFORMANCE.md
 *.ckpt
 *.safetensors
 
+# Performance work — local working docs and generated eval artifacts.
+# The harness CODE (perf_eval/*.py) is tracked; its outputs and the vendored
+# perceval eval package are not. The analysis + diary stay local (commit
+# messages must restate rationale standalone).
+PERFORMANCE_ANALYSIS.md
+PERFORMANCE_PROGRESS.md
+/perceval/
+perf_eval/baseline/
+perf_eval/runs/
+perf_eval/reports/
+perf_eval/out/
+perf_eval/*.log
+
 # Claude Code artifacts (anywhere in the tree)
 .claude/
 CLAUDE.md
