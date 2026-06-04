@@ -33,8 +33,14 @@ def main():
     print(f"[load] {time.perf_counter()-t0:.1f}s", flush=True)
 
     # Persistent state_dict in bf16, contiguous, on CPU for serialization.
+    # Exclude the causal-mask buffers that Model.setup_caches registers AFTER
+    # construction: they are not in the upstream checkpoint, so including them
+    # makes a strict load_state_dict reject the variant with "unexpected keys".
+    SKIP = ("causal_mask",)
     sd = {}
     for k, v in gen._model.state_dict().items():
+        if any(s in k for s in SKIP):
+            continue
         sd[k] = v.detach().to("cpu", torch.bfloat16).contiguous()
     nbytes = sum(t.numel() * t.element_size() for t in sd.values())
     print(f"[state_dict] {len(sd)} tensors, {nbytes/1e9:.1f} GB bf16", flush=True)
