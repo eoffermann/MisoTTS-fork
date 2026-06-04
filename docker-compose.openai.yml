@@ -26,6 +26,7 @@ services:
       - HF_HOME=/workspace/hf
     volumes:
       - miso-hf:/workspace/hf
+      - miso-inductor:/workspace/inductor_cache  # persisted torch.compile cache (one-time ~20min warmup)
       - ./deploy/prompts:/workspace/prompts
     shm_size: "8gb"
     deploy:
@@ -38,3 +39,4 @@ services:
 
 volumes:
   miso-hf:
+  miso-inductor:

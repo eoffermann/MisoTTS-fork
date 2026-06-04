@@ -64,6 +64,9 @@ perf_eval/*.log
 deploy/prompts/*.wav
 deploy/prompts/*.txt
 
+# Transient build / profile / push logs from container work.
+deploy/*.log
+
 # Claude Code artifacts (anywhere in the tree)
 .claude/
 CLAUDE.md

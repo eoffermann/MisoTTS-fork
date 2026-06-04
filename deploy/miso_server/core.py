@@ -60,10 +60,104 @@ def _maybe_compile(model) -> None:
         return
     try:
         # Compile the per-frame decode hot path. reduce-overhead uses CUDA graphs.
-        model._model.backbone = torch.compile(model._model.backbone, mode="reduce-overhead")
-        model._model.decoder = torch.compile(model._model.decoder, mode="reduce-overhead")
+        # Originals are saved so warmup can revert to eager if compilation (which
+        # happens lazily on the first forward) fails on the torchtune decode path.
+        # reduce-overhead uses CUDA graphs (biggest win, but fragile with dynamic
+        # shapes / the KV cache). MISO_COMPILE_MODE can drop to "default" (plain
+        # Inductor fusion, no graphs) if the graph path does not hold.
+        mode = os.environ.get("MISO_COMPILE_MODE", "reduce-overhead")
+        _COMPILE_ORIG["backbone"] = model._model.backbone
+        _COMPILE_ORIG["decoder"] = model._model.decoder
+        model._model.backbone = torch.compile(model._model.backbone, mode=mode)
+        model._model.decoder = torch.compile(model._model.decoder, mode=mode)
+        print(f"[core] torch.compile enabled (mode={mode})", flush=True)
     except Exception as exc:  # pragma: no cover - defensive
-        print(f"[core] torch.compile skipped: {exc}", flush=True)
+        print(f"[core] torch.compile setup skipped: {exc}", flush=True)
+
+
+_COMPILE_ORIG: dict = {}
+
+
+def _revert_compile(model) -> None:
+    if _COMPILE_ORIG:
+        model._model.backbone = _COMPILE_ORIG["backbone"]
+        model._model.decoder = _COMPILE_ORIG["decoder"]
+        _COMPILE_ORIG.clear()
+
+
+# Model variants that actually exist on disk / are loadable today. As fp8/fp4/
+# int8 quantized checkpoints are produced, add them here and GPU-sense will pick
+# them. Today only the bf16 path is built.
+AVAILABLE_VARIANTS = set(
+    (os.environ.get("MISO_AVAILABLE_VARIANTS") or "bf16").split(",")
+)
+_DTYPE_FOR_VARIANT = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+
+
+def detect_device_profile() -> dict:
+    """Detect the GPU architecture and the model variant it would IDEALLY use,
+    plus the best variant we can actually load today.
+
+    arch by compute capability:
+      blackwell sm>=100 (B100/B200, RTX 50xx) -> native FP4 + FP8
+      hopper    sm 90   (H100)                 -> native FP8
+      ada       sm 89   (RTX 40, L40)          -> native FP8
+      ampere    sm 80/86/87 (A100, A6000, 30x) -> bf16, no native FP8
+    """
+    if not torch.cuda.is_available():
+        return {"arch": "cpu", "cc": 0, "name": "cpu", "vram_gb": 0.0,
+                "fp8_native": False, "fp4_native": False,
+                "ideal_variant": "fp32", "variant": "fp32"}
+    major, minor = torch.cuda.get_device_capability(0)
+    cc = major * 10 + minor
+    name = torch.cuda.get_device_name(0)
+    vram = torch.cuda.get_device_properties(0).total_memory / 1e9
+    arch = ("blackwell" if cc >= 100 else "hopper" if cc >= 90 else
+            "ada" if cc == 89 else "ampere" if cc >= 80 else
+            "turing" if cc >= 75 else "legacy")
+    fp8_native = cc >= 89
+    fp4_native = cc >= 100
+    ideal = "nvfp4" if fp4_native else "fp8" if fp8_native else "bf16"
+    # Best variant we have built, in preference order for this GPU.
+    pref = {"nvfp4": ["nvfp4", "fp8", "bf16"], "fp8": ["fp8", "bf16"], "bf16": ["bf16"]}[ideal]
+    variant = next((v for v in pref if v in AVAILABLE_VARIANTS), "bf16")
+    return {"arch": arch, "cc": cc, "name": name, "vram_gb": vram,
+            "fp8_native": fp8_native, "fp4_native": fp4_native,
+            "ideal_variant": ideal, "variant": variant}
+
+
+# HuggingFace distribution: ONE repo per variant under the org. Variant
+# checkpoints are pulled at runtime (NOT baked into the image), so the image
+# stays small and weights version independently. Each repo is env-overridable.
+# Until a variant repo is published, loading falls back to the upstream default.
+VARIANT_REPO = {
+    "bf16":  os.environ.get("MISO_REPO_BF16",  "BigBlueCeiling/MisoTTS-bf16"),
+    "fp8":   os.environ.get("MISO_REPO_FP8",   "BigBlueCeiling/MisoTTS-fp8"),
+    "nvfp4": os.environ.get("MISO_REPO_NVFP4", "BigBlueCeiling/MisoTTS-nvfp4"),
+}
+
+
+def resolve_model_source(variant: str):
+    """Checkpoint source for a variant, passed to load_miso_8b.
+
+    Precedence: explicit MISO_TTS_8B_MODEL override -> the variant's HF repo
+    (downloaded to a local path) -> None (load_miso_8b uses the upstream
+    default). hf_hub_download caches, so repeated starts do not re-download.
+    """
+    explicit = os.environ.get("MISO_TTS_8B_MODEL")
+    if explicit:
+        return explicit
+    repo = VARIANT_REPO.get(variant)
+    if repo:
+        try:
+            from huggingface_hub import hf_hub_download
+            path = hf_hub_download(repo_id=repo, filename="model.safetensors")
+            print(f"[core] pulled variant '{variant}' from {repo}", flush=True)
+            return path
+        except Exception as exc:
+            print(f"[core] {repo} not available ({type(exc).__name__}); "
+                  f"falling back to the default model", flush=True)
+    return None
 
 
 def get_generator():
@@ -79,9 +173,32 @@ def get_generator():
         from generator import load_miso_8b
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
+        prof = detect_device_profile()
+        # Persist the TorchInductor / CUDA-graph compile cache per GPU arch so the
+        # ~20 min compile warmup is paid ONCE (mount /workspace/inductor_cache as
+        # a volume). Per-SM dir so different GPU classes do not collide.
+        if prof["arch"] != "cpu":
+            os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR",
+                                  f"/workspace/inductor_cache/sm_{prof['cc']}")
+            os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
+        # MISO_MODEL_VARIANT can force a variant; otherwise use the auto-selected
+        # best-available one for this GPU.
+        variant = os.environ.get("MISO_MODEL_VARIANT", prof["variant"])
+        if variant not in _DTYPE_FOR_VARIANT:
+            # fp8/fp4/int8 need a built quantized checkpoint + a quantized load
+            # path (torchao). Not wired yet -> fall back to bf16 with a clear note.
+            print(f"[core] variant '{variant}' has no load path yet; using bf16.", flush=True)
+            variant = "bf16"
+        dtype = _DTYPE_FOR_VARIANT[variant]
+        if prof["arch"] != "cpu":
+            gap = (f" GPU could use '{prof['ideal_variant']}' but that variant is not "
+                   f"built; build it to unlock it." if prof["ideal_variant"] != variant else "")
+            print(f"[core] GPU {prof['name']} arch={prof['arch']} sm_{prof['cc']} "
+                  f"vram={prof['vram_gb']:.0f}GB fp8={prof['fp8_native']} fp4={prof['fp4_native']} "
+                  f"-> loading variant '{variant}' ({dtype}).{gap}", flush=True)
         t0 = time.perf_counter()
-        source = os.environ.get("MISO_TTS_8B_MODEL")
-        gen = load_miso_8b(device, model_path_or_repo_id=source)
+        source = resolve_model_source(variant)
+        gen = load_miso_8b(device, model_path_or_repo_id=source, dtype=dtype)
         _maybe_compile(gen)
         print(f"[core] model loaded on {device} in {time.perf_counter() - t0:.1f}s", flush=True)
         _GEN = gen
@@ -91,11 +208,21 @@ def get_generator():
 def warmup() -> None:
     """Run a few generations so torch.compile graphs are captured before serving."""
     gen = get_generator()
-    for text in ("Warming up.", "This is a slightly longer warmup utterance for the decoder."):
-        try:
+    texts = ("Warming up.", "This is a slightly longer warmup utterance for the decoder.")
+    try:
+        for text in texts:
             _ = gen.generate(text=text, speaker=0, context=[], max_audio_length_ms=6000)
-        except Exception as exc:  # pragma: no cover
-            print(f"[core] warmup error: {exc}", flush=True)
+    except Exception as exc:  # pragma: no cover
+        # Most likely a compile / CUDA-graph failure on the torchtune decode path.
+        # Revert to eager and retry so serving still works (without compile).
+        print(f"[core] compiled warmup failed ({type(exc).__name__}: {exc}); "
+              f"reverting to eager", flush=True)
+        _revert_compile(gen)
+        for text in texts:
+            try:
+                _ = gen.generate(text=text, speaker=0, context=[], max_audio_length_ms=6000)
+            except Exception as exc2:
+                print(f"[core] eager warmup error: {exc2}", flush=True)
     if str(getattr(gen, "device", "")).startswith("cuda"):
         torch.cuda.synchronize()
     print("[core] warmup complete", flush=True)

@@ -90,6 +90,49 @@ Baseline: this fork diverges from upstream `main` at commit `82a2874`.
   load phases are visible.
 - Commits: `7491c92` (initial), `8b1790b` (streaming + TTFB + logging).
 
+## Serving and deployment
+
+### Containerized serving (RunPod + OpenAI-compatible APIs)
+- What: a Linux/CUDA Docker image and a `miso_server` package that runs MisoTTS as
+  a service locally or on RunPod. Linux unlocks triton/Inductor (torch.compile,
+  CUDA graphs) and flash-attention SDPA, which the Windows dev box cannot use, so
+  this is where generation throughput actually improves (set `MISO_COMPILE=1`).
+- Surfaces: a RunPod serverless handler, a local RunPod simulator (`/runsync`
+  buffered like RunPod, plus `/stream_now` for local streaming since `/runsync`
+  cannot stream), and an OpenAI-compatible `POST /v1/audio/speech`. Two compose
+  paths: `docker-compose.runpod.yml` and `docker-compose.openai.yml`.
+- Voices: a named voice registry (pre-assigned reference wav + transcript,
+  Mimi-encoded once and reused). Built-in `default` voice always present.
+- See `deploy/README.md`.
+
+### Container compile speedup (the big throughput win)
+- With `MISO_COMPILE=1` (torch.compile reduce-overhead + flash SDPA) the container
+  reaches ~1.2 mean RTF vs ~14.5 on the Windows eager baseline: about a **12x
+  speedup** (near realtime on an A6000). Confirms the workload was
+  launch/dispatch-bound; CUDA graphs recover almost all of it. The compile warmup
+  is a one-time ~20 min cost, persisted via a per-SM TorchInductor cache volume.
+- This needs the Linux `devel` CUDA base plus build-essential and python3-dev
+  (triton JIT-compiles a Python.h-including helper); the runtime base cannot do it.
+
+### GPU-sense and per-arch model variants
+- `core.detect_device_profile()` selects a variant by GPU arch (Blackwell ->
+  nvfp4, Hopper/Ada -> fp8, Ampere -> bf16) and loads the best one BUILT, logging
+  the gap. Variants are pulled from per-variant HF repos under the org
+  (`BigBlueCeiling/MisoTTS-{bf16,fp8,nvfp4}`) at runtime (not baked), with
+  fallback to the upstream model until published.
+- nvfp4 (Blackwell FP4) scaffolding: `deploy/quantize_nvfp4.py` (torchao packing,
+  runs on any GPU) and `deploy/Dockerfile.blackwell` (newer stack). Unvalidated;
+  needs a Blackwell box and a torchtune port. Tracked for the B200.
+
+### Output loudness normalization
+- Problem: the raw model output has a ~19 dB clip-to-clip integrated-loudness
+  (LUFS) spread with no correlation to emotion (two "normal" clips ~18 dB apart),
+  and several clips near 0 dBFS. Output volume is unpredictable.
+- Fix: the serving core normalizes each clip to a target LUFS with a peak ceiling
+  (`MISO_TARGET_LUFS`, default -16). `perf_eval/amplitude.py` measures the spread.
+- Note: applied in the serving core (the deployable surface); raw `generate()` is
+  unchanged. Exposing it to the local profiler is a possible follow-up.
+
 ## Features carried from an open upstream PR
 
 ### Streaming generation API (`generate_stream`)

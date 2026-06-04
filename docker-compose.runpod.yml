@@ -26,8 +26,9 @@ services:
       - MISO_WARMUP=1
       - HF_HOME=/workspace/hf
     volumes:
-      - miso-hf:/workspace/hf            # model + codec + watermarker cache (persist)
-      - ./deploy/prompts:/workspace/prompts  # pre-assigned voice prompts
+      - miso-hf:/workspace/hf                 # model + codec + watermarker cache (persist)
+      - miso-inductor:/workspace/inductor_cache  # persisted torch.compile cache (one-time ~20min warmup)
+      - ./deploy/prompts:/workspace/prompts   # pre-assigned voice prompts
     shm_size: "8gb"
     deploy:
       resources:
@@ -39,3 +40,4 @@ services:
 
 volumes:
   miso-hf:
+  miso-inductor:
