@@ -91,11 +91,15 @@ not speed up this autoregressive decode, it only fits smaller cards.
 
 ## Performance and cold start (measured on an A6000)
 
-Measured on the stack in `deploy/Dockerfile` (torch 2.7.1 + cu128, torchao 0.13.0,
-torchtune 0.6.1, moshi 0.2.13). Build it with:
+Measured on the modern stack (torch 2.7.1 + cu128, torchao 0.13.0, torchtune
+0.6.1, moshi 0.2.13). Two images share this stack, differing only in entrypoint:
+`deploy/Dockerfile.runpod` (RunPod serverless handler) and `deploy/Dockerfile.openai`
+(OpenAI-compatible HTTP API on port 8080). Build whichever surface you are
+deploying:
 
 ```bash
-docker build -f deploy/Dockerfile -t miso-tts:latest .
+docker build -f deploy/Dockerfile.runpod -t miso-tts:runpod .   # RunPod serverless
+docker build -f deploy/Dockerfile.openai -t miso-tts:openai .   # OpenAI HTTP API
 ```
 
 Steady-state, compiled (`MISO_COMPILE=1`, reduce-overhead + flash SDPA), fully

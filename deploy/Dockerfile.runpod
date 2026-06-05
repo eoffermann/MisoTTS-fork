@@ -1,4 +1,10 @@
-# MisoTTS serving image (Linux + CUDA 12.8, torch 2.7.1).
+# MisoTTS serving image: RUNPOD serverless (Linux + CUDA 12.8, torch 2.7.1).
+#
+# Produces the RunPod serverless worker. The default CMD starts the generator
+# handler that real RunPod drives (no --rp_serve_api). For OpenAI-compatible HTTP
+# hosting, build deploy/Dockerfile.openai instead. The two images share the same
+# heavy dependency layers (kept byte-identical below) so a shared BuildKit cache
+# reuses them; only the header, EXPOSE, and CMD differ.
 #
 # Running on Linux unlocks triton/Inductor (torch.compile / CUDA graphs) and
 # flash-attention SDPA, which the Windows dev box cannot use, so this is where the
@@ -11,7 +17,7 @@
 #   - numpy 2 is ABI-fine on torch 2.7, so the old numpy<2 pin is dropped.
 #
 # Build (from the repo root):
-#   docker build -f deploy/Dockerfile -t miso-tts:latest .
+#   docker build -f deploy/Dockerfile.runpod -t miso-tts:runpod .
 # Optionally build flash-attn (slow): --build-arg INSTALL_FLASH_ATTN=1
 #
 # A CUDA 12.8 runtime runs on the box's newer (>=12.8) driver via forward compat.
@@ -61,5 +67,12 @@ RUN if [ "$INSTALL_FLASH_ATTN" = "1" ]; then pip install flash-attn --no-build-i
 # `pip install -e .` is needed, which also avoids re-pinning the old torch stack.
 ENV PYTHONPATH=/opt/miso:/opt/miso/deploy
 
-# Default: the RunPod serverless handler (real RunPod drives it; no --rp_serve_api).
+# EXPOSE is documentation only and is IGNORED by RunPod serverless (which drives the
+# handler over its own transport). It is used only by the local dev API mode:
+#   python -m miso_server.handler --rp_serve_api --rp_api_host 0.0.0.0 --rp_api_port 8000
+EXPOSE 8000
+
+# Real RunPod drives this handler (no --rp_serve_api). First job pays the lazy model
+# load + (if MISO_COMPILE=1) compile warmup; mount /workspace/inductor_cache to keep
+# the compile cache across cold starts.
 CMD ["python", "-m", "miso_server.handler"]
