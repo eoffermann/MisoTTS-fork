@@ -1,0 +1,51 @@
+# Modern serving stack (torch 2.7.1 + cu128). Used by deploy/Dockerfile.modern.
+#
+# Why this stack: torch 2.4.0 + torchao 0.9.0 cannot run quantization together
+# with torch.compile (FakeTensor tracing error) for any scheme, so the A6000's
+# INT8 tensor cores were unreachable. torch 2.7.1 + torchao 0.13.0 fixes that and
+# is also the first Blackwell-capable (cu128) torch, giving the broadest GPU range
+# from one stack. moshi caps torch < 2.10; torchao's official compat table pairs
+# 0.13.0 with torch 2.7.1; torchtune 0.6.1 is API-identical to 0.4.0 for our use
+# (367/367 checkpoint keys match, same cache/forward surface).
+#
+# torch / torchaudio come from the cu128 index in the Dockerfile (and pull a
+# matching triton automatically on Linux). silentcipher is a git dep installed
+# separately. numpy 2 is fine on torch 2.7 (the old numpy<2 ABI hack is gone);
+# only moshi's < 2.3 cap remains.
+
+torchtune==0.6.1
+torchao==0.13.0
+moshi==0.2.13
+
+# generator.py uses transformers.AutoTokenizer; this trio is internally coherent
+# and satisfies moshi's huggingface-hub < 1.0 cap.
+transformers==4.49.0
+tokenizers==0.21.0
+huggingface_hub[hf_transfer]==0.28.1
+
+# torchtune eagerly imports `datasets` at package import. <2.20 crashes on
+# pyarrow 24 (PyExtensionType removed); 4.x pulls huggingface-hub>=1.0 which
+# collides with moshi's <1.0. 3.x threads both needles. Inference never uses it.
+datasets>=3.0,<4.0
+
+# moshi caps numpy<2.3; everything below is what moshi/silentcipher/soundfile need.
+numpy>=1.26,<2.3
+einops>=0.7,<0.9
+sentencepiece>=0.2,<0.3
+safetensors>=0.4,<0.8
+
+# silentcipher (installed --no-deps in the Dockerfile so it cannot move the torch/
+# numpy pins) actually needs these at import/encode time. Its other declared deps
+# (huggingface-hub, scipy, soundfile, torch, torchaudio) are already present.
+# librosa pulls numba, which constrains numpy; the <2.3 cap above keeps a numba-
+# compatible numpy (resolves to 2.2.6 / numba 0.65).
+librosa>=0.10
+pydub>=0.25.1
+
+# serving surfaces
+fastapi>=0.110
+uvicorn[standard]>=0.29
+runpod>=1.6
+pydantic>=2.0
+soundfile>=0.12
+pyloudnorm>=0.1.1

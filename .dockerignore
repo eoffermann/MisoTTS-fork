@@ -4,6 +4,7 @@
 # generated audio / large checkpoints.
 .git
 .venv
+.venv-modern
 venv
 env
 __pycache__

@@ -9,16 +9,32 @@ description = "Miso TTS 8B inference code."
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
 license = { file = "LICENSE" }
+# Modern stack (torch 2.7.1 + cu128). The previous pins (torch 2.4.0 + torchao
+# 0.9.0 + torchtune 0.4.0 + moshi 0.2.2) could not run quantization together with
+# torch.compile (a FakeTensor tracing crash for every scheme) and could not target
+# Blackwell. This stack fixes both: torchao's official compat table pairs 0.13.0
+# with torch 2.7.1, moshi caps torch < 2.10, and torchtune 0.6.1 is API-identical
+# to 0.4.0 for our use (the 8B checkpoint loads strict, 367/367 keys). torch 2.7
+# supports numpy 2 (the old numpy<2 ABI hack is gone), and bitsandbytes was dropped
+# entirely (nothing imports it; moshi 0.2.13 only needs it for QLinear, which the
+# unquantized Mimi path never instantiates).
+#
+# For a CUDA build, install the torch wheels from the cu128 index first, e.g.:
+#   pip install torch==2.7.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128
+# then `pip install -e .` / `uv sync` for the rest. The bare PyPI torch is CPU-only.
 dependencies = [
-    "torch==2.4.0",
-    "torchaudio==2.4.0",
+    "torch==2.7.1",
+    "torchaudio==2.7.1",
     "tokenizers==0.21.0",
     "transformers==4.49.0",
     "huggingface_hub==0.28.1",
-    "moshi==0.2.2",
-    "bitsandbytes==0.45.5; sys_platform == 'linux'",
-    "torchtune==0.4.0",
-    "torchao==0.9.0",
+    "moshi==0.2.13",
+    "torchtune==0.6.1",
+    "torchao==0.13.0",
+    # torchtune imports `datasets` at package import; <2.20 crashes on pyarrow 24
+    # and 4.x pulls huggingface-hub>=1.0 (collides with moshi's <1.0). 3.x fits.
+    "datasets>=3.0,<4.0",
+    "numpy<2.3",  # moshi caps numpy<2.3; torch 2.7 is otherwise numpy-2 ABI-clean
     "silentcipher @ git+https://github.com/SesameAILabs/silentcipher@d46d7d0893a583d8968ab3a6626e2289faec9152",
 ]
 
