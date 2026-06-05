@@ -78,6 +78,18 @@ voice) always exists. See `deploy/prompts/README.md`.
 | `MISO_WARMUP` | `1` | run warmup generations at startup (bakes compile graphs) |
 | `MISO_TTS_8B_MODEL` | (HF default) | model path or repo id |
 | `HF_HOME` | `/workspace/hf` | model cache (mount a volume to persist) |
+| `MISO_QUANTIZE` | (auto by VRAM) | force weight precision: `bf16`/`none`, `int8`, or `int4`; overrides the VRAM auto-pick |
+| `MISO_BF16_MIN_GB` | `22` | VRAM at/above which bf16 is used (else int8/int4) |
+| `MISO_INT8_MIN_GB` | `13` | VRAM at/above which int8 is used (below -> int4) |
+| `MISO_REPO_BF16` / `MISO_REPO_INT8` / `MISO_REPO_INT4` | `BigBlueCeiling/MisoTTS-*` | per-variant HF repos |
+
+Weight precision is auto-selected by VRAM: bf16 on cards that fit it, else int8
+(~16 GB), else int4 (~12 GB). int8/int4 are pulled as pre-quantized checkpoints
+from their HF repos (falling back to quantizing the bf16 weights at load if a repo
+is missing or its packed layout does not load on this GPU). int8 is quality-neutral;
+int4 is experimental and audibly degraded (see the main README and
+PERFORMANCE_PROGRESS.md). Quantization is a memory lever, not a speed one - it does
+not speed up this autoregressive decode, it only fits smaller cards.
 
 ## Performance and cold start (measured on an A6000)
 

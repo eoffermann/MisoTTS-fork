@@ -146,3 +146,39 @@ Baseline: this fork diverges from upstream `main` at commit `82a2874`.
 ### Windows PowerShell examples in the Quickstart
 - What: added PowerShell command examples alongside the existing shell examples.
 - Commit: `ae00c82`.
+
+## Stack modernization and quantized variants
+
+### Modernized the torch stack to 2.7.1 + cu128
+- Problem: the upstream pins (torch 2.4.0, torchao 0.9.0, torchtune 0.4.0, moshi
+  0.2.2) could not run quantization together with `torch.compile` - every scheme
+  crashed in FakeTensor tracing - and cu124 could not target Blackwell. The model
+  also could not be matched to smaller GPUs.
+- Fix: bump to torch 2.7.1+cu128, torchaudio 2.7.1, torchao 0.13.0 (its official
+  torch-2.7.1 pairing), torchtune 0.6.1, moshi 0.2.13. torchtune 0.6.1 is
+  API-identical to 0.4.0 for our use (the 8B checkpoint loads strict, 367/367
+  keys), so models.py is unchanged; only moshi_compat.py needed a guard for moshi
+  0.2.13's reworked quantize module. Dropped the numpy<2 ABI hack (torch 2.7 is
+  numpy-2 clean) and bitsandbytes (never imported). Verified on an A6000: int8 +
+  compile now runs, compiled bf16 holds RTF ~1.11-1.13, and the compile warmup
+  caches across processes (~68% faster second cold start - impossible on 2.4).
+- Commits: `1fa5513`, `44aa97f`, `c3e9385`, `d9b82ed`.
+
+### Memory-matched quantized variants (int8 / int4), GPU-sense by VRAM
+- Problem: an 8B bf16 model needs ~20 GB at generation peak, classing out 12-16 GB
+  cards entirely. Quantization could lower that floor, but only if it actually
+  preserves quality and is wired to be selected automatically.
+- Fix: the serving core reads VRAM and loads the highest-quality precision that
+  fits - bf16 (>=22 GB), int8 (>=13 GB, ~16 GB cards), int4 (below, ~12 GB cards).
+  int8/int4 are weight-only torchao quants of the backbone/decoder Linears
+  (embeddings/heads stay bf16), pulled as pre-quantized checkpoints from
+  `BigBlueCeiling/MisoTTS-int8` and `-int4`, with a fall-back that quantizes the
+  bf16 weights at load (layer-wise, so a small card never holds the full bf16
+  model) if a repo is missing or its packed layout does not load on the GPU.
+- Quality (perceval, 12 canonical prompts): int8 is quality-neutral (mean CER/WER/
+  UTMOS even with bf16); int4 is experimental and audibly degraded (UTMOS ~2.9 vs
+  3.9, worse on long lines). Documented as such.
+- Note: quantization here is a MEMORY lever, not a speed one - the frame-by-frame
+  decode's M=1 matmuls cannot feed the hardware low-precision GEMMs (int8 `_int_mm`,
+  fp8/fp4 `_scaled_mm` need M>=16), so weight-only int8/int4 dequantize to bf16 for
+  the matmul. That is why no hardware-fp8 or Blackwell-nvfp4 variant is shipped.

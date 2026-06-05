@@ -83,26 +83,34 @@ recent cards, so that contributors and deployments are not classed out by a
 single hardware requirement. Lowering that floor matters for continued
 development: more people can run it, profile it, and contribute.
 
-The mechanism is selectable, hardware-matched model variants. The serving core
-detects the GPU architecture and selects the best variant that exists, falling
-back to bf16 and logging the gap when it detects a GPU that could use a
-better-but-not-yet-built variant. Variants live in separate Hugging Face repos
-and are pulled at runtime, so the image stays small and weights version
-independently.
+The mechanism is selectable, memory-matched model variants. The serving core
+reads the GPU's VRAM and loads the highest-quality weight precision that fits,
+pulling a pre-quantized checkpoint from Hugging Face at runtime (falling back to
+the bf16 weights quantized at load if a variant repo is missing).
 
-| Variant | Precision | Roughly suits | Status |
-|---|---|---|---|
-| `bf16` | bfloat16 weights | ~16-20 GB VRAM, Ampere or newer (RTX 3090/4090, A6000, ...) | available |
-| `int8` / `fp8` weight-only | 8-bit weights, bf16 compute (runs on most recent GPUs) | lighter memory; broad compatibility | evaluating |
-| `fp8` (hardware) | fp8 tensor cores | Ada / Hopper / Blackwell (sm 8.9+) | planned, hardware-gated |
-| `nvfp4` | 4-bit Blackwell FP4 | smallest and fastest, Blackwell only | planned, hardware-gated |
+| Variant | Weights | Fits (gen peak) | Quality vs bf16 | Status |
+|---|---|---|---|---|
+| `bf16` | bfloat16 | ~24 GB (A6000, 3090/4090, A100, ...) | reference | default |
+| `int8` | int8 weight-only | ~16 GB (4060 Ti 16G, 4070 Ti S, A4000) | even (CER/WER/UTMOS ~unchanged) | experimental |
+| `int4` | int4 weight-only | ~12 GB (3060 12G, 4070) | noticeably lower (UTMOS ~2.9 vs 3.9; worse on long lines) | experimental |
+
+Why only these, and why "memory" not "speed": MisoTTS decodes one frame at a
+time, so the per-step matmuls are tiny (M=1). The GPU low-precision tensor-core
+GEMMs (int8 `_int_mm`, fp8/fp4 `_scaled_mm`) all require M>=16, so they cannot run
+this autoregressive decode at all. Weight-only int8/int4 therefore dequantize to
+bf16 for the matmul: you get the VRAM saving, not a throughput win, and that holds
+on ANY GPU - so there is no reason to ship hardware-fp8 or Blackwell-nvfp4
+variants (they would only save memory, which int8/int4 already do everywhere, and
+the cards that run nvfp4 mostly are not memory-constrained).
 
 Realistic caveats:
-- Quantized variants trade some quality for memory and throughput. We measure
-  both, with the quality harness below, before recommending one.
-- The biggest throughput wins (CUDA graphs, flash-attention, hardware
-  low-precision) need a modern GPU and a current CUDA stack. Older but supported
-  cards get correctness and bf16, not the fastest paths.
+- These are weight-only and quality-measured (see Quality gating). int8 is
+  quality-neutral; int4 is a last-resort "runs at all" tier with audible quality
+  loss, especially on long utterances. Prefer the largest precision your card fits.
+- 8 GB is not reachable even at int4: the Mimi decode and activation peak on long
+  clips sit several GB above the weights.
+- The big throughput wins (CUDA graphs, flash-attention) are on the bf16 + compile
+  path on a card that fits bf16; quantization is purely for fitting smaller cards.
 
 ## Quality gating
 
