@@ -133,6 +133,18 @@ class Model(
 
         self.backbone, backbone_dim = _prepare_transformer(FLAVORS[config.backbone_flavor]())
         self.decoder, decoder_dim = _prepare_transformer(FLAVORS[config.decoder_flavor]())
+        # Eager handle to the backbone for the variable-length PREFILL forward (the
+        # first frame of an utterance, seq_len = prompt_len). core._maybe_compile
+        # replaces self.backbone with a reduce-overhead OptimizedModule whose CUDA
+        # graph can only capture the fixed seq_len=1 DECODE; the prefill's varying
+        # seq_len cannot be graphed and runs ~15x a decode frame un-graphed, which
+        # dominates TTFB on longer prompts. generate_frame routes the prefill here.
+        # Held in a 1-element LIST so nn.Module does NOT register it as a duplicate
+        # submodule (that would put duplicate keys in state_dict and break the strict
+        # load). It captures the eager backbone now; compile later only swaps
+        # self.backbone, leaving this pointing at the eager module (and at the eager
+        # one again after a revert). If compile is off it equals self.backbone.
+        self._backbone_prefill = [self.backbone]
 
         self.text_embeddings = nn.Embedding(config.text_vocab_size, backbone_dim)
         self.audio_embeddings = nn.Embedding(config.audio_vocab_size * config.audio_num_codebooks, backbone_dim)
@@ -185,7 +197,15 @@ class Model(
         embeds = self._embed_tokens(tokens)
         masked_embeds = embeds * tokens_mask.unsqueeze(-1)
         h = masked_embeds.sum(dim=2)
-        h = self.backbone(h, input_pos=input_pos, mask=curr_backbone_mask).to(dtype=dtype)
+        # PREFILL (s>1, first frame): run EAGER. The compiled backbone is
+        # reduce-overhead (CUDA graphs need static shapes); the prefill's seq_len
+        # varies with prompt length, so the graphed path cannot capture it and runs
+        # ~15x a decode frame un-graphed. The eager module has no shape constraint
+        # and no graph-launch penalty. DECODE (s==1) keeps the compiled+graphed
+        # path. Same forward, same mask, same shared KV cache -> numerically and
+        # causally identical; only the wrapper differs.
+        backbone = self._backbone_prefill[0] if s > 1 else self.backbone
+        h = backbone(h, input_pos=input_pos, mask=curr_backbone_mask).to(dtype=dtype)
 
         last_h = h[:, -1, :]
         c0_logits = self.codebook0_head(last_h)

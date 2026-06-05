@@ -68,6 +68,9 @@ def _maybe_compile(model) -> None:
         mode = os.environ.get("MISO_COMPILE_MODE", "reduce-overhead")
         _COMPILE_ORIG["backbone"] = model._model.backbone
         _COMPILE_ORIG["decoder"] = model._model.decoder
+        # Note: model._model._backbone_prefill (a 1-element list set in Model.__init__)
+        # already holds the EAGER backbone; compiling only swaps self.backbone, so the
+        # prefill keeps routing to the eager module with no extra bookkeeping here.
         model._model.backbone = torch.compile(model._model.backbone, mode=mode)
         model._model.decoder = torch.compile(model._model.decoder, mode=mode)
         print(f"[core] torch.compile enabled (mode={mode})", flush=True)
