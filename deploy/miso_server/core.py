@@ -85,6 +85,35 @@ def _revert_compile(model) -> None:
         _COMPILE_ORIG.clear()
 
 
+def _apply_quant(gen, scheme: str) -> None:
+    """Apply torchao weight-only quantization to the model's Linear layers.
+
+    fp8_weight_only / int8_weight_only run on ANY GPU: weights are stored
+    quantized and dequantized to bf16 for the matmul (so this is NOT the
+    hardware-fp8 scaled_mm path, which needs sm_89+). Gives weight-memory savings
+    and some precision loss; throughput depends on whether the saved bandwidth
+    beats the dequant overhead (measure it). Skips the small output heads.
+    """
+    import torch.nn as nn
+    try:
+        from torchao.quantization import quantize_
+        if scheme == "fp8_weight_only":
+            from torchao.quantization import float8_weight_only as cfg
+        elif scheme == "int8_weight_only":
+            from torchao.quantization import int8_weight_only as cfg
+        else:
+            print(f"[core] unknown MISO_QUANTIZE='{scheme}'; skipping", flush=True)
+            return
+
+        def _filt(mod, fqn):
+            return isinstance(mod, nn.Linear) and "head" not in fqn and "projection" not in fqn
+
+        quantize_(gen._model, cfg(), filter_fn=_filt)
+        print(f"[core] applied weight-only quantization: {scheme}", flush=True)
+    except Exception as exc:  # pragma: no cover
+        print(f"[core] quantize {scheme} failed: {exc}", flush=True)
+
+
 # Model variants that actually exist on disk / are loadable today. As fp8/fp4/
 # int8 quantized checkpoints are produced, add them here and GPU-sense will pick
 # them. Today only the bf16 path is built.
@@ -199,6 +228,9 @@ def get_generator():
         t0 = time.perf_counter()
         source = resolve_model_source(variant)
         gen = load_miso_8b(device, model_path_or_repo_id=source, dtype=dtype)
+        quant = os.environ.get("MISO_QUANTIZE")
+        if quant:
+            _apply_quant(gen, quant)
         _maybe_compile(gen)
         print(f"[core] model loaded on {device} in {time.perf_counter() - t0:.1f}s", flush=True)
         _GEN = gen
