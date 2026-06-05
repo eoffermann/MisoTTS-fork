@@ -11,7 +11,11 @@ Input schema (job["input"]):
   voice: str = "default"
   stream: bool = false
   audio_format: "wav" | "opus" | "flac" | "pcm" = "wav"
-  chunk_frames: int = 25
+  chunk_frames: int        # streaming emit-size CAP (default 25 via MISO_STREAM_MAX_FRAMES)
+  start_frames: int        # first emit size in frames (default 1 = 80 ms, low TTFB)
+  ramp: float              # emit-size growth factor (default 2.0)
+  rtf_adapt: bool          # jump to the cap when generation is slower than realtime
+  wm_defer_ms: float       # skip watermarking the leading ms (default 0)
   temperature: float = 0.9
   topk: int = 50
   seed: int | null
@@ -30,12 +34,22 @@ from . import core
 
 def _coerce_input(job: dict) -> dict:
     inp = job.get("input", job) or {}
+    def _opt(key, cast):
+        v = inp.get(key)
+        return cast(v) if v is not None else None
+
     return {
         "text": inp.get("text", ""),
         "voice": inp.get("voice", core.DEFAULT_VOICE),
         "stream": bool(inp.get("stream", False)),
         "audio_format": inp.get("audio_format", "wav"),
-        "chunk_frames": int(inp.get("chunk_frames", 25)),
+        # Ramp controls; None lets the core fall back to the MISO_STREAM_* env
+        # defaults (cap 25, start 1 frame, x2 growth) so RunPod ramps by default.
+        "chunk_frames": _opt("chunk_frames", int),
+        "start_frames": _opt("start_frames", int),
+        "ramp": _opt("ramp", float),
+        "rtf_adapt": _opt("rtf_adapt", bool),
+        "wm_defer_ms": _opt("wm_defer_ms", float),
         "temperature": float(inp.get("temperature", 0.9)),
         "topk": int(inp.get("topk", 50)),
         "seed": inp.get("seed"),
@@ -65,7 +79,10 @@ def handler(job):
     ttfb = None
     idx = 0
     for chunk, sr in core.synth_stream(p["text"], voice=p["voice"], temperature=p["temperature"],
-                                       topk=p["topk"], chunk_frames=p["chunk_frames"], seed=p["seed"]):
+                                       topk=p["topk"], chunk_frames=p["chunk_frames"],
+                                       start_frames=p["start_frames"], ramp=p["ramp"],
+                                       rtf_adapt=p["rtf_adapt"], wm_defer_ms=p["wm_defer_ms"],
+                                       seed=p["seed"]):
         if ttfb is None:
             ttfb = (time.perf_counter() - t0) * 1000.0
         b64, content_type = audiolib.encode_b64(chunk, sr, p["audio_format"])

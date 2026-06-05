@@ -402,23 +402,50 @@ def synth(text: str, voice: Optional[str] = None, *, max_audio_length_ms: int = 
     return a, gen.sample_rate
 
 
+def _stream_env(name, default, cast):
+    val = os.environ.get(name)
+    if val is None or val == "":
+        return default
+    try:
+        return cast(val)
+    except (TypeError, ValueError):
+        return default
+
+
 def synth_stream(text: str, voice: Optional[str] = None, *, max_audio_length_ms: int = 40_000,
-                 temperature: float = 0.9, topk: int = 50, chunk_frames: int = 25,
+                 temperature: float = 0.9, topk: int = 50, chunk_frames: Optional[int] = None,
+                 start_frames: Optional[int] = None, ramp: Optional[float] = None,
+                 rtf_adapt: Optional[bool] = None, wm_defer_ms: Optional[float] = None,
                  target_lufs: Optional[float] = DEFAULT_TARGET_LUFS,
                  seed: Optional[int] = None) -> Iterator[tuple[np.ndarray, int]]:
     """Streaming synthesis. Yields (float32 mono chunk, sample_rate) per chunk.
 
-    Note: per-chunk loudness normalization is applied with a fixed peak ceiling
-    only (no per-chunk LUFS retarget, which would pump level between chunks);
-    full-clip LUFS targeting is available via synth().
+    Emits on a low-latency ramp by default (first chunk = one 80 ms frame, then
+    growing up to a cap), so every streaming caller gets a low TTFB without asking.
+    Ramp parameters resolve as explicit arg > MISO_STREAM_* env > default:
+      chunk_frames / MISO_STREAM_MAX_FRAMES  cap (default 25),
+      start_frames / MISO_STREAM_START_FRAMES first emit in frames (default 1),
+      ramp / MISO_STREAM_RAMP                growth factor (default 2.0),
+      rtf_adapt / MISO_STREAM_RTF_ADAPT      jump to cap when RTF > 1 (default off),
+      wm_defer_ms / MISO_WM_DEFER_MS         skip watermarking the leading ms (default 0).
+
+    Per-chunk loudness uses a fixed peak ceiling only (no per-chunk LUFS retarget,
+    which would pump level between chunks); full-clip LUFS is available via synth().
     """
     gen = get_generator()
     v = _get_voice(voice)
     if seed is not None:
         torch.manual_seed(seed)
+    cap = chunk_frames if chunk_frames is not None else _stream_env("MISO_STREAM_MAX_FRAMES", 25, int)
+    start = start_frames if start_frames is not None else _stream_env("MISO_STREAM_START_FRAMES", 1, int)
+    rmp = ramp if ramp is not None else _stream_env("MISO_STREAM_RAMP", 2.0, float)
+    adapt = rtf_adapt if rtf_adapt is not None else bool(_stream_env("MISO_STREAM_RTF_ADAPT", 0, int))
+    wm = wm_defer_ms if wm_defer_ms is not None else _stream_env("MISO_WM_DEFER_MS", 0.0, float)
     for chunk in gen.generate_stream(text=text, speaker=v.speaker, context=list(v.context),
                                      max_audio_length_ms=max_audio_length_ms,
-                                     temperature=temperature, topk=topk, chunk_frames=chunk_frames):
+                                     temperature=temperature, topk=topk,
+                                     max_frames=cap, start_frames=start, ramp=rmp,
+                                     rtf_adapt=adapt, wm_defer_ms=wm):
         a = chunk.detach().float().cpu().numpy()
         a = normalize_loudness(a, gen.sample_rate, target_lufs=None)  # peak ceiling only
         yield a, gen.sample_rate

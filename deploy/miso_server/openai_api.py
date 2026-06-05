@@ -33,6 +33,10 @@ class SpeechRequest(BaseModel):
     speed: float = 1.0          # accepted for compatibility; MisoTTS has no rate ctrl yet
     stream: bool = False        # extension: stream raw audio chunks
     seed: int | None = None
+    # Extensions (optional, off-schema): tune the low-latency emit ramp. Absent ->
+    # the MISO_STREAM_* env defaults, so standard OpenAI clients still get the ramp.
+    stream_max_frames: int | None = None    # emit-size cap in frames (default 25)
+    stream_start_frames: int | None = None  # first emit size in frames (default 1 = 80 ms)
 
 
 @app.on_event("startup")
@@ -67,7 +71,9 @@ def speech(req: SpeechRequest):
 
     if req.stream:
         def gen_chunks():
-            for chunk, sr in core.synth_stream(req.input, voice=req.voice, seed=req.seed):
+            for chunk, sr in core.synth_stream(req.input, voice=req.voice, seed=req.seed,
+                                               chunk_frames=req.stream_max_frames,
+                                               start_frames=req.stream_start_frames):
                 data, _ = audiolib.encode(chunk, sr, "pcm")  # raw PCM frames for streaming
                 yield data
         return StreamingResponse(gen_chunks(), media_type="audio/L16",

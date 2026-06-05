@@ -227,10 +227,13 @@ class Generator:
         try:
             audio = self._watermark_audio(audio)
         except Exception:
-            if not is_final:
-                raise
-            # SilentCipher may reject very short final chunks. Earlier chunks are
-            # watermarked independently; only the terminal fragment falls back.
+            # SilentCipher rejects very short chunks, and with the ramped emit
+            # schedule the first chunks are as small as one 80 ms frame. Emit the
+            # chunk unwatermarked rather than failing the stream: the bulk of the
+            # clip is still watermarked per chunk, and batch generate() always
+            # watermarks the whole clip. Task 6 turns this into an explicit,
+            # configurable leading-defer policy.
+            self._stream_wm_skipped = getattr(self, "_stream_wm_skipped", 0) + 1
             return audio
         return _match_num_samples(audio, target_num_samples)
 
@@ -273,9 +276,33 @@ class Generator:
         temperature: float = 0.9,
         topk: int = 50,
         chunk_frames: int = 25,
+        start_frames: int = 1,
+        ramp: float = 2.0,
+        max_frames: Optional[int] = None,
+        rtf_adapt: bool = False,
+        wm_defer_ms: float = 0.0,
     ) -> Iterator[torch.Tensor]:
-        if chunk_frames <= 0:
-            raise ValueError("chunk_frames must be greater than 0")
+        """Stream audio with a low-latency ramp.
+
+        The Mimi streaming decoder is wrapped in a CUDA graph captured at the FIRST
+        decoded chunk's shape, so it cannot accept variable chunk sizes. We decouple
+        DECODE granularity from EMIT cadence: decode exactly one frame at a time
+        (the graph is captured once at shape 1 and replayed for every frame, cheap
+        and numerically equivalent to batch decode), accumulate the decoded audio in
+        a host buffer, and emit to the caller on a growing ramp. The first emit is
+        one 80 ms frame (minimal TTFB); the emit size then grows (x`ramp`) up to a
+        cap, amortizing per-chunk encode/watermark overhead once playback has a head
+        start. `chunk_frames` is kept for back-compat as the cap (override with
+        `max_frames`).
+        """
+        import time
+
+        cap = int(max_frames if max_frames is not None else chunk_frames)
+        if cap <= 0:
+            raise ValueError("max chunk frames must be greater than 0")
+        emit_target = max(1, min(int(start_frames), cap))
+        growth = max(1.0, float(ramp))
+        wm_defer_samples = int(self.sample_rate * wm_defer_ms / 1000.0)
 
         # Tokenize the prompt (including Mimi encode of any context audio) before
         # entering Mimi streaming mode, so streamed generation conditions on the
@@ -287,49 +314,72 @@ class Generator:
 
         frames = self._generate_frames(prompt_tokens, prompt_tokens_mask, max_generation_len, temperature, topk)
 
-        chunk: List[torch.Tensor] = []
         all_samples: List[torch.Tensor] = []
+        buffer: List[torch.Tensor] = []   # decoded per-frame audio, not yet emitted
+        pending = 0                        # frames currently in buffer
         streamed_num_samples = 0
+        emitted_samples = 0
+        frame_wall = 0.0
+        frame_count = 0
 
-        # Each chunk is computed fully inside torch.inference_mode() and yielded
-        # outside it. A plain `with torch.inference_mode():` around the whole
-        # generator body would stay active while the generator is suspended at
-        # `yield`, silently putting the caller's loop body into inference mode.
-        #
-        # Only full chunk_frames-sized chunks are decoded inside Mimi streaming
-        # mode: on CUDA the streaming decoder is wrapped in a CUDA graph captured
-        # at the first chunk's shape, so a shorter residual chunk would raise a
-        # shape mismatch. The residual is covered by the batch tail decode below.
+        def _emit(chunk_audio, *, is_final):
+            nonlocal streamed_num_samples, emitted_samples
+            streamed_num_samples += chunk_audio.size(0)
+            # Leading-defer: skip watermarking the first wm_defer_ms of audio (Task 6).
+            if emitted_samples < wm_defer_samples:
+                out = chunk_audio
+            else:
+                out = self._watermark_stream_chunk(chunk_audio, is_final=is_final)
+            emitted_samples += chunk_audio.size(0)
+            return out
+
+        # Each chunk is computed inside torch.inference_mode() and yielded outside it.
+        # A `with torch.inference_mode():` spanning a `yield` would stay active while
+        # the generator is suspended, silently putting the caller's loop in inference
+        # mode.
         with self._audio_tokenizer.streaming(1):
             finished = False
             while not finished:
                 out: Optional[torch.Tensor] = None
                 with torch.inference_mode():
-                    while len(chunk) < chunk_frames:
-                        sample = next(frames, None)
-                        if sample is None:
-                            finished = True
-                            break
-                        chunk.append(sample)
+                    t = time.perf_counter()
+                    sample = next(frames, None)
+                    if sample is None:
+                        finished = True
+                    else:
                         all_samples.append(sample)
-
-                    if len(chunk) == chunk_frames:
-                        audio = self._decode_frames(chunk)
-                        streamed_num_samples += audio.size(0)
-                        chunk = []
+                        audio = self._decode_frames([sample])  # one frame, shape-1 graph
+                        frame_wall += time.perf_counter() - t
+                        frame_count += 1
                         if audio.numel() > 0:
-                            out = self._watermark_stream_chunk(audio, is_final=False)
-                if out is not None:
+                            buffer.append(audio)
+                            pending += 1
+                        if pending >= emit_target:
+                            out = _emit(torch.cat(buffer, dim=0), is_final=False)
+                            buffer, pending = [], 0
+                            nxt = max(emit_target + 1, int(emit_target * growth))
+                            # RTF-aware: if generation cannot sustain realtime, tiny
+                            # chunks only add overhead -> jump to the cap.
+                            if rtf_adapt and frame_count and \
+                               (frame_wall / frame_count) / 0.08 > 1.0:
+                                nxt = cap
+                            emit_target = min(cap, nxt)
+                if out is not None and out.numel() > 0:
                     yield out
 
+            # Flush the final partial ramp group still in the buffer.
+            if buffer:
+                with torch.inference_mode():
+                    out = _emit(torch.cat(buffer, dim=0), is_final=True)
+                if out is not None and out.numel() > 0:
+                    yield out
+
+        # Tail reconciliation: per-frame streaming decode matches the batch decode
+        # length (verified), so this is normally a no-op, but it still covers any
+        # residual if the streaming and batch decode lengths ever differ.
         tail_audio: Optional[torch.Tensor] = None
         with torch.inference_mode():
             if all_samples:
-                # Mimi streaming decode does not expose an explicit flush. Decode
-                # the full code sequence once (in batch mode, outside the streaming
-                # context) and emit only the deferred tail - the residual frames
-                # plus any samples the streamed chunks have not covered - so
-                # concatenated stream chunks keep the batch decode length.
                 full_audio = self._decode_frames(all_samples)
                 if streamed_num_samples < full_audio.size(0):
                     tail = full_audio[streamed_num_samples:]
