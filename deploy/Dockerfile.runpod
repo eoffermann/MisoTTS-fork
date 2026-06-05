@@ -58,7 +58,11 @@ RUN pip install --no-deps \
 # 4) Project source last, so dependency layers stay cached across code edits.
 COPY . /opt/miso
 
-# 5) Optional flash-attention (slow to build; torch's flash SDPA works without it).
+# 5) Optional flash-attention. MEASURED unnecessary on this stack: torch's flash
+#    SDPA is already the selected backend for the backbone GQA shapes (32 q / 8 kv,
+#    head_dim 128) at both decode (seq 1) and prefill, and attention is a tiny
+#    fraction of the bandwidth-bound per-frame cost. Left opt-in; if you do want it,
+#    prefer a prebuilt cu128/torch2.7/cp310 wheel over this slow source build.
 ARG INSTALL_FLASH_ATTN=0
 RUN if [ "$INSTALL_FLASH_ATTN" = "1" ]; then pip install flash-attn --no-build-isolation; fi
 
