@@ -80,6 +80,20 @@ voice) always exists. See `deploy/prompts/README.md`.
 | `MISO_BF16_MIN_GB` | `22` | VRAM at/above which bf16 is used (else int8/int4) |
 | `MISO_INT8_MIN_GB` | `13` | VRAM at/above which int8 is used (below -> int4) |
 | `MISO_REPO_BF16` / `MISO_REPO_INT8` / `MISO_REPO_INT4` | `BigBlueCeiling/MisoTTS-*` | per-variant HF repos |
+| `MISO_STREAM_START_FRAMES` | `1` | first streamed emit size in frames (1 = 80 ms, low TTFB) |
+| `MISO_STREAM_RAMP` | `2.0` | emit-size growth factor per chunk |
+| `MISO_STREAM_MAX_FRAMES` | `25` | streamed emit-size cap in frames |
+| `MISO_STREAM_RTF_ADAPT` | `0` | jump to the cap when generation is slower than realtime |
+| `MISO_WM_DEFER_MS` | `0` | skip watermarking the leading ms of streamed audio (latency vs coverage; ~15-20 ms TTFB) |
+| `MISO_EOS_CHECK_EVERY` | `5` | frames between EOS host-sync checks (lower = fewer overshoot frames) |
+| `MISO_COMPILE_STRICT` | `0` | raise (vs silent eager fallback) if compile reverts; benchmarks set this on |
+
+Streaming emits on a low-latency ramp by default: the first chunk is one 80 ms
+frame, then the emit size grows (x`MISO_STREAM_RAMP`) up to the cap, so TTFB is the
+prefill plus one frame rather than a 2 s buffer. The decoder always decodes one
+frame at a time (a single stable CUDA-graph shape); the ramp is purely an emit
+policy. OpenAI clients can override per request with `stream_max_frames` /
+`stream_start_frames`.
 
 Weight precision is auto-selected by VRAM: bf16 on cards that fit it, else int8
 (~16 GB), else int4 (~12 GB). int8/int4 are pulled as pre-quantized checkpoints
