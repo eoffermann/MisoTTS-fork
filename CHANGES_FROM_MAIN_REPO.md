@@ -114,15 +114,14 @@ Baseline: this fork diverges from upstream `main` at commit `82a2874`.
 - This needs the Linux `devel` CUDA base plus build-essential and python3-dev
   (triton JIT-compiles a Python.h-including helper); the runtime base cannot do it.
 
-### GPU-sense and per-arch model variants
-- `core.detect_device_profile()` selects a variant by GPU arch (Blackwell ->
-  nvfp4, Hopper/Ada -> fp8, Ampere -> bf16) and loads the best one BUILT, logging
-  the gap. Variants are pulled from per-variant HF repos under the org
-  (`BigBlueCeiling/MisoTTS-{bf16,fp8,nvfp4}`) at runtime (not baked), with
-  fallback to the upstream model until published.
-- nvfp4 (Blackwell FP4) scaffolding: `deploy/quantize_nvfp4.py` (torchao packing,
-  runs on any GPU) and `deploy/Dockerfile.blackwell` (newer stack). Unvalidated;
-  needs a Blackwell box and a torchtune port. Tracked for the B200.
+### GPU-sense model variants
+- `core.detect_device_profile()` originally selected a variant by GPU arch
+  (Blackwell -> nvfp4, Hopper/Ada -> fp8, Ampere -> bf16). This was REWORKED to a
+  VRAM-based selection (bf16 / int8 / int4) once measurement showed the
+  frame-by-frame decode cannot feed the hardware low-precision GEMMs, so fp8/nvfp4
+  give no speed benefit for this model (see "Stack modernization and quantized
+  variants" below for the current design). The unvalidated nvfp4 scaffold
+  (`deploy/quantize_nvfp4.py`, `deploy/Dockerfile.blackwell`) was dropped.
 
 ### Output loudness normalization
 - Problem: the raw model output has a ~19 dB clip-to-clip integrated-loudness

@@ -1,62 +1,64 @@
-# MisoTTS serving image (Linux + CUDA).
+# MisoTTS serving image (Linux + CUDA 12.8, torch 2.7.1).
 #
-# Running on Linux unlocks what the Windows dev box cannot: triton/Inductor
-# (torch.compile / CUDA graphs) and flash-attention SDPA kernels. Set
-# MISO_COMPILE=1 at runtime to compile the model; flash SDPA is used
-# automatically by torch on Linux where available.
+# Running on Linux unlocks triton/Inductor (torch.compile / CUDA graphs) and
+# flash-attention SDPA, which the Windows dev box cannot use, so this is where the
+# generation throughput actually improves. Why this stack:
+#   - torch 2.4 + torchao 0.9 could not do quantization + torch.compile together
+#     (FakeTensor tracing error) for any scheme; torch 2.7.1 + torchao 0.13.0 fixes
+#     that, which is what makes the int8/int4 variants work.
+#   - cu128 is the first Blackwell-capable CUDA build, so one image covers Ampere
+#     through Blackwell (broadest GPU range).
+#   - numpy 2 is ABI-fine on torch 2.7, so the old numpy<2 pin is dropped.
 #
 # Build (from the repo root):
 #   docker build -f deploy/Dockerfile -t miso-tts:latest .
 # Optionally build flash-attn (slow): --build-arg INSTALL_FLASH_ATTN=1
+#
+# A CUDA 12.8 runtime runs on the box's newer (>=12.8) driver via forward compat.
 
 # DEVEL (not runtime) base: triton/Inductor JIT-compiles kernels at runtime and
-# needs a C compiler + CUDA headers (cuda.h, nvcc). The cudnn-runtime image has
-# neither, so torch.compile fails with "Failed to find C compiler". The devel
-# image plus build-essential provides them.
-FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+# needs a C compiler + CUDA headers (cuda.h, nvcc). ubuntu22.04 ships python3.10,
+# which matches the cp310 cu128 wheels.
+FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1 PYTHONUNBUFFERED=1
 ENV HF_HOME=/workspace/hf MISO_PROMPTS_DIR=/workspace/prompts
 
+# python3-dev is needed up front: triton JIT-compiles a cuda_utils helper that
+# #includes <Python.h>, and Inductor needs a C compiler (build-essential).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3.10 python3-pip git ffmpeg libsndfile1 ca-certificates build-essential \
+        python3.10 python3-dev python3-pip git ffmpeg libsndfile1 ca-certificates build-essential \
     && ln -sf /usr/bin/python3.10 /usr/bin/python \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/miso
 
-# 1) Pin the torch stack (cu124 wheels) and numpy<2 (ABI) BEFORE installing the
-#    project, so the project deps do not pull a CPU torch or numpy 2.x. The
-#    "==2.4.0" spec in pyproject is satisfied by the local "+cu124" build.
+# 1) torch stack from the cu128 index FIRST, so nothing below pulls a CPU torch.
+#    This also pulls a matching triton (Inductor backend) automatically on Linux.
 RUN python -m pip install --upgrade pip \
-    && pip install "numpy<2" torch==2.4.0 torchaudio==2.4.0 \
-        --index-url https://download.pytorch.org/whl/cu124
+    && pip install torch==2.7.1 torchaudio==2.7.1 \
+        --index-url https://download.pytorch.org/whl/cu128
 
-# 2) Install the project and its remaining deps from pyproject (transformers,
-#    moshi, torchtune, torchao, bitsandbytes [linux], silentcipher [git]). Then
-#    re-pin numpy<2 in case a transitive dep bumped it.
+# 2) The model + quant + serving deps (pinned, see the file for rationale).
+COPY deploy/requirements-modern.txt /opt/miso/deploy/requirements-modern.txt
+RUN pip install -r deploy/requirements-modern.txt
+
+# 3) SilentCipher watermarker (git, same pin as upstream). --no-deps so it cannot
+#    drag the torch/numpy/hf pins resolved above; its runtime deps (torch,
+#    torchaudio, numpy) are already present.
+RUN pip install --no-deps \
+    "silentcipher @ git+https://github.com/SesameAILabs/silentcipher@d46d7d0893a583d8968ab3a6626e2289faec9152"
+
+# 4) Project source last, so dependency layers stay cached across code edits.
 COPY . /opt/miso
-RUN pip install -e . \
-    && pip install "numpy<2"
 
-# 3) Triton (Inductor backend for torch.compile) and serving deps.
-RUN pip install triton \
-    && pip install -r deploy/requirements-serving.txt \
-    && pip install "numpy<2"
-
-# 3b) Python dev headers. triton JIT-compiles a cuda_utils helper that
-#     #includes <Python.h>, so the headers must be present or torch.compile
-#     fails. Kept as a separate late layer so the torch/pip layers above (and
-#     the already-pushed image layers) stay cached.
-RUN apt-get update && apt-get install -y --no-install-recommends python3-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-# 4) Optional flash-attention (slow to build; flash SDPA works without it too).
+# 5) Optional flash-attention (slow to build; torch's flash SDPA works without it).
 ARG INSTALL_FLASH_ATTN=0
 RUN if [ "$INSTALL_FLASH_ATTN" = "1" ]; then pip install flash-attn --no-build-isolation; fi
 
 # PYTHONPATH includes the repo root (so `generator`, `models` import) AND deploy/
-# (so the `miso_server` package imports).
+# (so the `miso_server` package imports). The package itself is import-by-path; no
+# `pip install -e .` is needed, which also avoids re-pinning the old torch stack.
 ENV PYTHONPATH=/opt/miso:/opt/miso/deploy
 
 # Default: the RunPod serverless handler (real RunPod drives it; no --rp_serve_api).

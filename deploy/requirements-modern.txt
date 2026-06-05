@@ -1,4 +1,4 @@
-# Modern serving stack (torch 2.7.1 + cu128). Used by deploy/Dockerfile.modern.
+# Serving stack (torch 2.7.1 + cu128). Used by deploy/Dockerfile.
 #
 # Why this stack: torch 2.4.0 + torchao 0.9.0 cannot run quantization together
 # with torch.compile (FakeTensor tracing error) for any scheme, so the A6000's

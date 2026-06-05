@@ -10,10 +10,8 @@ model produces a ~19 dB clip-to-clip loudness spread).
 
 ```
 deploy/
-  Dockerfile.modern           Linux + CUDA 12.8 image (torch 2.7.1+cu128) - RECOMMENDED
-  requirements-modern.txt     modern model + quant + serving deps (see file header)
-  Dockerfile                  legacy CUDA 12.4 image (torch 2.4.0+cu124); superseded
-  requirements-serving.txt    legacy serving-only deps for the cu124 Dockerfile
+  Dockerfile                  Linux + CUDA 12.8 image (torch 2.7.1+cu128)
+  requirements-modern.txt     model + quant + serving deps (see file header)
   miso_server/
     core.py                   one model load; voice registry; loudness norm; synth()/synth_stream()
     audio.py                  wav/flac/opus/pcm encode + base64
@@ -93,11 +91,11 @@ not speed up this autoregressive decode, it only fits smaller cards.
 
 ## Performance and cold start (measured on an A6000)
 
-Measured on the modern stack (torch 2.7.1 + cu128, torchao 0.13.0, torchtune
-0.6.1, moshi 0.2.13 - see `deploy/Dockerfile.modern`). Build it with:
+Measured on the stack in `deploy/Dockerfile` (torch 2.7.1 + cu128, torchao 0.13.0,
+torchtune 0.6.1, moshi 0.2.13). Build it with:
 
 ```bash
-docker build -f deploy/Dockerfile.modern -t miso-tts:modern .
+docker build -f deploy/Dockerfile -t miso-tts:latest .
 ```
 
 Steady-state, compiled (`MISO_COMPILE=1`, reduce-overhead + flash SDPA), fully
