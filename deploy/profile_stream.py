@@ -24,6 +24,11 @@ import time
 sys.path.insert(0, "/opt/miso")
 sys.path.insert(0, "/opt/miso/deploy")
 
+# Benchmarks fail loudly if compile silently reverts to eager (so a baseline is
+# never an accidental eager number). Serving leaves this off for resilience.
+if os.environ.get("MISO_COMPILE", "0") == "1":
+    os.environ.setdefault("MISO_COMPILE_STRICT", "1")
+
 _T0 = time.perf_counter()
 
 

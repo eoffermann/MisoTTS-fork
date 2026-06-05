@@ -257,16 +257,42 @@ def get_generator():
         return _GEN
 
 
+def compile_status(gen) -> str:
+    """ACTIVE if backbone AND decoder are torch.compile OptimizedModules, else EAGER.
+
+    torch.compile wraps a module in an OptimizedModule; after a successful warmup
+    that also means the reduce-overhead CUDA graphs were captured (warmup would have
+    raised otherwise). This is the definitive, unambiguous regime label so a
+    benchmark is never silently an eager baseline.
+    """
+    m = getattr(gen, "_model", None)
+    bb = type(getattr(m, "backbone", None)).__name__
+    dc = type(getattr(m, "decoder", None)).__name__
+    return "ACTIVE" if (bb == "OptimizedModule" and dc == "OptimizedModule") else "EAGER"
+
+
 def warmup() -> None:
-    """Run a few generations so torch.compile graphs are captured before serving."""
+    """Run a few generations so torch.compile graphs are captured before serving.
+
+    MISO_COMPILE_STRICT=1 makes a compile / CUDA-graph failure RAISE instead of
+    silently reverting to eager, so benchmarks and deploy smoke tests fail loudly
+    rather than measuring an eager regime by accident. Default OFF in serving
+    (graceful eager fallback for resilience); the benchmark harness turns it ON.
+    """
     gen = get_generator()
+    requested = os.environ.get("MISO_COMPILE", "0") == "1"
+    strict = os.environ.get("MISO_COMPILE_STRICT", "0") == "1"
     texts = ("Warming up.", "This is a slightly longer warmup utterance for the decoder.")
     try:
         for text in texts:
             _ = gen.generate(text=text, speaker=0, context=[], max_audio_length_ms=6000)
     except Exception as exc:  # pragma: no cover
         # Most likely a compile / CUDA-graph failure on the torchtune decode path.
-        # Revert to eager and retry so serving still works (without compile).
+        if requested and strict:
+            raise RuntimeError(
+                f"compiled warmup failed and MISO_COMPILE_STRICT=1 (would have reverted "
+                f"to eager and silently lost the compile win): {type(exc).__name__}: {exc}"
+            ) from exc
         print(f"[core] compiled warmup failed ({type(exc).__name__}: {exc}); "
               f"reverting to eager", flush=True)
         _revert_compile(gen)
@@ -277,7 +303,11 @@ def warmup() -> None:
                 print(f"[core] eager warmup error: {exc2}", flush=True)
     if str(getattr(gen, "device", "")).startswith("cuda"):
         torch.cuda.synchronize()
-    print("[core] warmup complete", flush=True)
+    status = compile_status(gen)
+    if requested and status != "ACTIVE":
+        print("[core] WARNING: MISO_COMPILE=1 requested but compile=EAGER (reverted); "
+              "set MISO_COMPILE_STRICT=1 to fail instead of silently degrading", flush=True)
+    print(f"[core] warmup complete; compile={status} (MISO_COMPILE={int(requested)})", flush=True)
 
 
 # ---------------------------------------------------------------------------
