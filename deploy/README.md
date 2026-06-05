@@ -10,8 +10,10 @@ model produces a ~19 dB clip-to-clip loudness spread).
 
 ```
 deploy/
-  Dockerfile                  Linux + CUDA 12.4 image (torch 2.4.0+cu124, triton, deps)
-  requirements-serving.txt    fastapi / uvicorn / runpod / soundfile / pyloudnorm
+  Dockerfile.modern           Linux + CUDA 12.8 image (torch 2.7.1+cu128) - RECOMMENDED
+  requirements-modern.txt     modern model + quant + serving deps (see file header)
+  Dockerfile                  legacy CUDA 12.4 image (torch 2.4.0+cu124); superseded
+  requirements-serving.txt    legacy serving-only deps for the cu124 Dockerfile
   miso_server/
     core.py                   one model load; voice registry; loudness norm; synth()/synth_stream()
     audio.py                  wav/flac/opus/pcm encode + base64
@@ -76,6 +78,48 @@ voice) always exists. See `deploy/prompts/README.md`.
 | `MISO_WARMUP` | `1` | run warmup generations at startup (bakes compile graphs) |
 | `MISO_TTS_8B_MODEL` | (HF default) | model path or repo id |
 | `HF_HOME` | `/workspace/hf` | model cache (mount a volume to persist) |
+
+## Performance and cold start (measured on an A6000)
+
+Measured on the modern stack (torch 2.7.1 + cu128, torchao 0.13.0, torchtune
+0.6.1, moshi 0.2.13 - see `deploy/Dockerfile.modern`). Build it with:
+
+```bash
+docker build -f deploy/Dockerfile.modern -t miso-tts:modern .
+```
+
+Steady-state, compiled (`MISO_COMPILE=1`, reduce-overhead + flash SDPA), fully
+warmed (RTF = wall / audio seconds; lower is faster):
+- Batch RTF ~1.11-1.13 (near realtime), about 10x faster than eager (~10.9).
+- Streaming TTFB ~3.2-5.4 s (vs ~22 s eager).
+- The first couple of generations are slower while reduce-overhead recompiles
+  across the first frame shapes; steady state is reached by the third clip.
+
+Cold start (fresh process): about 7 min, split:
+- model load ~165-175 s (32 GB read + cast; the bf16 variant halves this), and
+- compile warmup ~237 s (first generation 161 s + a reshape recompile).
+
+**The compile warmup now caches across processes** (the old torch-2.4 stack could
+not - a warm run there still paid the full ~18 min). With a persisted per-SM
+inductor cache, a second cold start's warmup drops from ~237 s to ~75 s (~68%)
+and TTFB from 5.4 s to 3.2 s, for ~4 min total cold-start-to-serving. The serving
+core already points `TORCHINDUCTOR_CACHE_DIR` at `/workspace/inductor_cache/sm_<cc>`
+and enables the FX graph cache; **mount that path as a persistent volume** so the
+warmup is paid once per GPU architecture, not per cold start. The residual ~75 s
+is CUDA-graph capture, which is inherently per-process and cannot be cached, so a
+warm/min worker (RunPod active workers / FlashBoot) is still ideal for the lowest
+per-request latency. Eager (`MISO_COMPILE=0`, RTF ~10.9) remains the fallback when
+a worker cannot be kept warm.
+
+Quantization (`MISO_QUANTIZE`): on Ampere (A6000) it is **not** a throughput win
+for this model. int8 weight-only dequantizes to bf16 for the matmul (the INT8
+tensor cores need int8 x int8), adding overhead on a compute-bound model
+(compiled RTF 1.36 vs bf16's 1.13); int8 dynamic (W8A8) cannot run at all because
+the autoregressive decode's tiny per-step matmuls (M=1/10) violate the CUTLASS
+INT8 GEMM's M>16 requirement. The now-working quant+compile path matters for the
+GPUs where the precision math pays off: hardware fp8 on Ada/Hopper (sm 8.9+) and
+nvfp4 on Blackwell, which the cu128 stack also enables. **Default to bf16 +
+compile on Ampere.**
 
 ## Notes / TODO
 
