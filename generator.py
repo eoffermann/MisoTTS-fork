@@ -1,6 +1,8 @@
 import contextlib
 from dataclasses import dataclass
 import os
+import queue
+import threading
 from typing import Iterator, List, Optional, Tuple
 
 os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "60")
@@ -343,6 +345,16 @@ class Generator:
             emitted_samples += chunk_audio.size(0)
             return out
 
+        # Pipeline path: a worker thread owns a side CUDA stream and does the
+        # per-frame Mimi decode + ramp emit + watermark + cpu-copy, so the main
+        # thread keeps the GPU GENERATING continuously instead of idling through
+        # decode/watermark/yield between bursts (recovers toward the batch RTF).
+        # Off by default until validated; MISO_STREAM_PIPELINE=1 enables it.
+        if os.environ.get("MISO_STREAM_PIPELINE", "0") == "1" and str(self.device).startswith("cuda"):
+            yield from self._generate_stream_pipelined(
+                frames, all_samples, emit_target, cap, growth, rtf_adapt, wm_defer_samples)
+            return
+
         # Each chunk is computed inside torch.inference_mode() and yielded outside it.
         # A `with torch.inference_mode():` spanning a `yield` would stay active while
         # the generator is suspended, silently putting the caller's loop in inference
@@ -414,6 +426,152 @@ class Generator:
 
         if tail_audio is not None:
             yield tail_audio
+
+    def _generate_stream_pipelined(self, frames, all_samples, emit_target, cap, growth,
+                                   rtf_adapt, wm_defer_samples):
+        """Overlap the per-frame decode + watermark + cpu-copy with generation.
+
+        A single worker thread owns a dedicated CUDA stream and the Mimi streaming
+        context: it pulls generated frames over in_q, decodes each on its stream,
+        ramp-buffers, watermarks + copies finished chunks to the CPU, and pushes
+        them over out_q. The MAIN thread runs only the autoregressive generation
+        loop (keeping the GPU busy back to back) plus the one end-of-stream EOS
+        sync, and yields the worker's finished CPU chunks in order. Ordering is FIFO
+        via the single worker. inference_mode is thread-local, so the worker enters
+        its own and the driver holds none at any yield. The decode stream is
+        event-synced to the generation stream so a frame is never decoded before
+        generation finishes writing it.
+        """
+        import time as _time
+
+        backlog = max(2, int(os.environ.get("MISO_STREAM_PIPELINE_BACKLOG", "8")))
+        in_q: "queue.Queue" = queue.Queue(maxsize=backlog)
+        out_q: "queue.Queue" = queue.Queue(maxsize=backlog)
+        decode_stream = torch.cuda.Stream(device=self.device)
+        state = {"streamed": 0, "error": None}
+        _ERR, _END = object(), object()
+
+        def worker():
+            emit_t = emit_target
+            buf, pending, emitted_frames, emitted_samples = [], 0, 0, 0
+            frame_wall, frame_count = 0.0, 0
+
+            def finish(chunk, *, is_final):
+                nonlocal emitted_samples
+                state["streamed"] += chunk.size(0)
+                out = (chunk if emitted_samples < wm_defer_samples
+                       else self._watermark_stream_chunk(chunk, is_final=is_final))
+                emitted_samples += chunk.size(0)
+                decode_stream.synchronize()  # block the WORKER (not generation) until ready
+                return out.detach().to("cpu")
+
+            try:
+                # All worker GPU work runs on decode_stream, so the Mimi streaming
+                # CUDA graph is captured AND replayed on this one stream (never the
+                # default generation stream), and streaming(1) state is touched only
+                # here.
+                with torch.inference_mode(), torch.cuda.stream(decode_stream), \
+                        self._audio_tokenizer.streaming(1):
+                    while True:
+                        item = in_q.get()
+                        if item[0] is _END:
+                            buf = buf[:max(0, item[1] - emitted_frames)]  # trim overshoot
+                            if buf:
+                                out_q.put(finish(torch.cat(buf, dim=0), is_final=True))
+                            out_q.put(_END)
+                            return
+                        sample, ev = item
+                        decode_stream.wait_event(ev)
+                        t = _time.perf_counter()
+                        audio = self._decode_frames([sample])  # one frame, shape-1 graph
+                        frame_wall += _time.perf_counter() - t
+                        frame_count += 1
+                        if audio.numel() > 0:
+                            buf.append(audio)
+                            pending += 1
+                        if pending >= emit_t:
+                            out_q.put(finish(torch.cat(buf, dim=0), is_final=False))
+                            emitted_frames += pending
+                            buf, pending = [], 0
+                            nxt = max(emit_t + 1, int(emit_t * growth))
+                            if rtf_adapt and frame_count and (frame_wall / frame_count) / 0.08 > 1.0:
+                                nxt = cap
+                            emit_t = min(cap, nxt)
+            except BaseException as exc:  # surface worker faults to the driver
+                state["error"] = exc
+                out_q.put(_ERR)
+
+        w = threading.Thread(target=worker, name="miso-stream-decode", daemon=True)
+        w.start()
+
+        keep_frames = 0
+        try:
+            while True:
+                with torch.inference_mode():
+                    sample = next(frames, None)
+                if sample is None:
+                    break
+                all_samples.append(sample)
+                ev = torch.cuda.Event()
+                ev.record()  # on the current (default/generation) stream
+                # Drain finished chunks before possibly blocking on a full in_q, so a
+                # full out_q + full in_q cannot deadlock.
+                while True:
+                    try:
+                        o = out_q.get_nowait()
+                    except queue.Empty:
+                        break
+                    if o is _ERR:
+                        raise state["error"] or RuntimeError("stream worker failed")
+                    if o is not _END and o.numel() > 0:
+                        yield o
+                in_q.put((sample, ev))
+
+            # EOS-trim boundary, one main-thread sync, identical to the sync path.
+            keep_frames = len(all_samples)
+            if all_samples:
+                with torch.inference_mode():
+                    last_nonzero = len(all_samples) - 1
+                    while last_nonzero >= 0 and bool((all_samples[last_nonzero] == 0).all()):
+                        last_nonzero -= 1
+                    keep_frames = min(len(all_samples), last_nonzero + 2)
+            in_q.put((_END, keep_frames))
+
+            while True:
+                o = out_q.get()
+                if o is _END:
+                    break
+                if o is _ERR:
+                    raise state["error"] or RuntimeError("stream worker failed")
+                if o.numel() > 0:
+                    yield o
+        finally:
+            # Unblock a worker stuck on a full out_q (e.g. consumer GeneratorExit)
+            # so it can see _END and exit, then join.
+            try:
+                in_q.put_nowait((_END, 0))
+            except queue.Full:
+                pass
+            deadline = _time.perf_counter() + 10.0
+            while w.is_alive() and _time.perf_counter() < deadline:
+                try:
+                    out_q.get(timeout=0.1)
+                except queue.Empty:
+                    pass
+            w.join(timeout=1.0)
+
+        # Tail reconciliation on the main thread, after the worker (and the Mimi
+        # streaming context) is done, against the same EOS-trimmed frame set.
+        tail_audio = None
+        with torch.inference_mode():
+            if keep_frames > 0:
+                full_audio = self._decode_frames(all_samples[:keep_frames])
+                if state["streamed"] < full_audio.size(0):
+                    tail = full_audio[state["streamed"]:]
+                    if tail.numel() > 0:
+                        tail_audio = self._watermark_stream_chunk(tail, is_final=True)
+        if tail_audio is not None:
+            yield tail_audio.detach().to("cpu")
 
 
 def _state_dict_from_checkpoint(checkpoint: object) -> dict[str, torch.Tensor]:
