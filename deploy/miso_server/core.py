@@ -93,6 +93,11 @@ def _pick_quant_by_vram(vram_gb: float) -> Optional[str]:
     matmuls (M=1 backbone, M=10 decoder) cannot feed the hardware low-precision
     GEMMs (int8 `_int_mm`, fp8/fp4 `_scaled_mm` all require M>=16), so dynamic /
     activation quant and hardware fp8/nvfp4 give NO speed win here and are not used.
+    Even weight-only is not a bandwidth win: re-measured on the modern compile-
+    capable stack (torch 2.7 + torchao 0.13, the combo that motivated the upgrade),
+    int8 weight-only + torch.compile streams at RTF ~2.75 vs bf16+compile ~1.49 -
+    the fused path still dequantizes to bf16 at M=1 (more HBM traffic), it does not
+    read int8. So int8/int4 are used ONLY to fit a smaller card, never for speed.
     We pick the highest-quality precision that fits: bf16 on big cards, then int8,
     then int4 (both weight-only, dequant-to-bf16, runnable on ANY GPU). Measured
     peaks (eager): bf16 ~17-20 GB, int8 ~10-12 GB, int4 ~6-8 GB; the defaults leave
