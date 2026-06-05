@@ -85,58 +85,40 @@ def _revert_compile(model) -> None:
         _COMPILE_ORIG.clear()
 
 
-def _apply_quant(gen, scheme: str) -> None:
-    """Apply torchao weight-only quantization to the model's Linear layers.
+def _pick_quant_by_vram(vram_gb: float) -> Optional[str]:
+    """Choose the runtime weight-quant tier that fits this GPU's VRAM.
 
-    fp8_weight_only / int8_weight_only run on ANY GPU: weights are stored
-    quantized and dequantized to bf16 for the matmul (so this is NOT the
-    hardware-fp8 scaled_mm path, which needs sm_89+). Gives weight-memory savings
-    and some precision loss; throughput depends on whether the saved bandwidth
-    beats the dequant overhead (measure it). Skips the small output heads.
+    Quantization for MisoTTS is purely a MEMORY lever (see
+    generator._quantize_and_move): the frame-by-frame decode's tiny per-step
+    matmuls (M=1 backbone, M=10 decoder) cannot feed the hardware low-precision
+    GEMMs (int8 `_int_mm`, fp8/fp4 `_scaled_mm` all require M>=16), so dynamic /
+    activation quant and hardware fp8/nvfp4 give NO speed win here and are not used.
+    We pick the highest-quality precision that fits: bf16 on big cards, then int8,
+    then int4 (both weight-only, dequant-to-bf16, runnable on ANY GPU). Measured
+    peaks (eager): bf16 ~17-20 GB, int8 ~10-12 GB, int4 ~6-8 GB; the defaults leave
+    headroom for torch.compile's CUDA-graph pools. Thresholds are env-tunable.
     """
-    import torch.nn as nn
-    try:
-        from torchao.quantization import quantize_
-        if scheme == "fp8_weight_only":
-            from torchao.quantization import float8_weight_only as cfg
-        elif scheme == "int8_weight_only":
-            from torchao.quantization import int8_weight_only as cfg
-        else:
-            print(f"[core] unknown MISO_QUANTIZE='{scheme}'; skipping", flush=True)
-            return
-
-        def _filt(mod, fqn):
-            return isinstance(mod, nn.Linear) and "head" not in fqn and "projection" not in fqn
-
-        quantize_(gen._model, cfg(), filter_fn=_filt)
-        print(f"[core] applied weight-only quantization: {scheme}", flush=True)
-    except Exception as exc:  # pragma: no cover
-        print(f"[core] quantize {scheme} failed: {exc}", flush=True)
-
-
-# Model variants that actually exist on disk / are loadable today. As fp8/fp4/
-# int8 quantized checkpoints are produced, add them here and GPU-sense will pick
-# them. Today only the bf16 path is built.
-AVAILABLE_VARIANTS = set(
-    (os.environ.get("MISO_AVAILABLE_VARIANTS") or "bf16").split(",")
-)
-_DTYPE_FOR_VARIANT = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+    bf16_min = float(os.environ.get("MISO_BF16_MIN_GB", "22"))
+    int8_min = float(os.environ.get("MISO_INT8_MIN_GB", "13"))
+    if vram_gb >= bf16_min:
+        return None
+    if vram_gb >= int8_min:
+        return "int8"
+    return "int4"
 
 
 def detect_device_profile() -> dict:
-    """Detect the GPU architecture and the model variant it would IDEALLY use,
-    plus the best variant we can actually load today.
+    """Detect the GPU and the runtime weight-quant tier that fits its VRAM.
 
-    arch by compute capability:
-      blackwell sm>=100 (B100/B200, RTX 50xx) -> native FP4 + FP8
-      hopper    sm 90   (H100)                 -> native FP8
-      ada       sm 89   (RTX 40, L40)          -> native FP8
-      ampere    sm 80/86/87 (A100, A6000, 30x) -> bf16, no native FP8
+    arch is reported for logging only; selection is purely VRAM-driven, because
+    quantization here is a memory lever, not a speed one (see _pick_quant_by_vram).
+      blackwell sm>=100 (B100/B200, RTX 50xx)
+      hopper    sm 90   (H100)
+      ada       sm 89   (RTX 40, L40)
+      ampere    sm 80/86/87 (A100, A6000, 30x)
     """
     if not torch.cuda.is_available():
-        return {"arch": "cpu", "cc": 0, "name": "cpu", "vram_gb": 0.0,
-                "fp8_native": False, "fp4_native": False,
-                "ideal_variant": "fp32", "variant": "fp32"}
+        return {"arch": "cpu", "cc": 0, "name": "cpu", "vram_gb": 0.0, "quant": None}
     major, minor = torch.cuda.get_device_capability(0)
     cc = major * 10 + minor
     name = torch.cuda.get_device_name(0)
@@ -144,34 +126,32 @@ def detect_device_profile() -> dict:
     arch = ("blackwell" if cc >= 100 else "hopper" if cc >= 90 else
             "ada" if cc == 89 else "ampere" if cc >= 80 else
             "turing" if cc >= 75 else "legacy")
-    fp8_native = cc >= 89
-    fp4_native = cc >= 100
-    ideal = "nvfp4" if fp4_native else "fp8" if fp8_native else "bf16"
-    # Best variant we have built, in preference order for this GPU.
-    pref = {"nvfp4": ["nvfp4", "fp8", "bf16"], "fp8": ["fp8", "bf16"], "bf16": ["bf16"]}[ideal]
-    variant = next((v for v in pref if v in AVAILABLE_VARIANTS), "bf16")
     return {"arch": arch, "cc": cc, "name": name, "vram_gb": vram,
-            "fp8_native": fp8_native, "fp4_native": fp4_native,
-            "ideal_variant": ideal, "variant": variant}
+            "quant": _pick_quant_by_vram(vram)}
 
 
-# HuggingFace distribution: ONE repo per variant under the org. Variant
-# checkpoints are pulled at runtime (NOT baked into the image), so the image
-# stays small and weights version independently. Each repo is env-overridable.
-# Until a variant repo is published, loading falls back to the upstream default.
+# HuggingFace distribution: the weights live in ONE bf16 repo, pulled at runtime
+# (NOT baked into the image). int8/int4 are produced by quantizing those bf16
+# weights at load (see generator._quantize_and_move) rather than shipped as
+# separate checkpoints: torchao 0.13 has no portable safetensors serialization for
+# quantized tensors, and int4's tinygemm layout is architecture-specific, so a
+# distributed quantized checkpoint would be fragile. Env-overridable.
 VARIANT_REPO = {
-    "bf16":  os.environ.get("MISO_REPO_BF16",  "BigBlueCeiling/MisoTTS-bf16"),
-    "fp8":   os.environ.get("MISO_REPO_FP8",   "BigBlueCeiling/MisoTTS-fp8"),
-    "nvfp4": os.environ.get("MISO_REPO_NVFP4", "BigBlueCeiling/MisoTTS-nvfp4"),
+    "bf16": os.environ.get("MISO_REPO_BF16", "BigBlueCeiling/MisoTTS-bf16"),
+    # Pre-quantized variants (torch.save'd torchao state_dicts, model.pt). Pulled
+    # when GPU-sense picks int8/int4; if a repo is absent we fall back to the bf16
+    # weights and quantize at load.
+    "int8": os.environ.get("MISO_REPO_INT8", "BigBlueCeiling/MisoTTS-int8"),
+    "int4": os.environ.get("MISO_REPO_INT4", "BigBlueCeiling/MisoTTS-int4"),
 }
 
 
-def resolve_model_source(variant: str):
-    """Checkpoint source for a variant, passed to load_miso_8b.
+def resolve_model_source(variant: str = "bf16"):
+    """bf16 checkpoint source passed to load_miso_8b.
 
-    Precedence: explicit MISO_TTS_8B_MODEL override -> the variant's HF repo
-    (downloaded to a local path) -> None (load_miso_8b uses the upstream
-    default). hf_hub_download caches, so repeated starts do not re-download.
+    Precedence: explicit MISO_TTS_8B_MODEL override -> the bf16 HF repo (downloaded
+    to a local path) -> None (load_miso_8b uses the upstream default).
+    hf_hub_download caches, so repeated starts do not re-download.
     """
     explicit = os.environ.get("MISO_TTS_8B_MODEL")
     if explicit:
@@ -181,12 +161,35 @@ def resolve_model_source(variant: str):
         try:
             from huggingface_hub import hf_hub_download
             path = hf_hub_download(repo_id=repo, filename="model.safetensors")
-            print(f"[core] pulled variant '{variant}' from {repo}", flush=True)
+            print(f"[core] pulled bf16 weights from {repo}", flush=True)
             return path
         except Exception as exc:
             print(f"[core] {repo} not available ({type(exc).__name__}); "
                   f"falling back to the default model", flush=True)
     return None
+
+
+def resolve_prequant_source(scheme: str):
+    """Pull the pre-quantized model.pt for `scheme` (int8/int4) from its HF repo.
+
+    Returns a local path, or None if no repo / the file is unavailable / the user
+    pinned an explicit bf16 model (then the caller quantizes the bf16 weights at
+    load instead). hf_hub_download caches across starts.
+    """
+    if os.environ.get("MISO_TTS_8B_MODEL"):
+        return None  # explicit bf16 override -> quantize that at load, do not pull
+    repo = VARIANT_REPO.get(scheme)
+    if not repo:
+        return None
+    try:
+        from huggingface_hub import hf_hub_download
+        path = hf_hub_download(repo_id=repo, filename="model.pt")
+        print(f"[core] pulled pre-quantized {scheme} from {repo}", flush=True)
+        return path
+    except Exception as exc:
+        print(f"[core] pre-quantized {scheme} repo {repo} unavailable "
+              f"({type(exc).__name__}); will quantize bf16 at load", flush=True)
+        return None
 
 
 def get_generator():
@@ -210,27 +213,44 @@ def get_generator():
             os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR",
                                   f"/workspace/inductor_cache/sm_{prof['cc']}")
             os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
-        # MISO_MODEL_VARIANT can force a variant; otherwise use the auto-selected
-        # best-available one for this GPU.
-        variant = os.environ.get("MISO_MODEL_VARIANT", prof["variant"])
-        if variant not in _DTYPE_FOR_VARIANT:
-            # fp8/fp4/int8 need a built quantized checkpoint + a quantized load
-            # path (torchao). Not wired yet -> fall back to bf16 with a clear note.
-            print(f"[core] variant '{variant}' has no load path yet; using bf16.", flush=True)
-            variant = "bf16"
-        dtype = _DTYPE_FOR_VARIANT[variant]
+        # Runtime weight-quant tier. Explicit MISO_QUANTIZE overrides the VRAM
+        # auto-pick; "" / "none" / "bf16" force full bf16. int8/int4 quantize the
+        # bf16 weights layer-wise AT LOAD (generator._quantize_and_move) so a small
+        # card never has to hold the full bf16 model.
+        override = os.environ.get("MISO_QUANTIZE")
+        if override is not None:
+            override = override.strip().lower()
+            quant = None if override in ("", "none", "bf16") else override
+        else:
+            quant = prof["quant"]
+        if quant not in (None, "int8", "int4"):
+            print(f"[core] unknown quant '{quant}'; using bf16.", flush=True)
+            quant = None
         if prof["arch"] != "cpu":
-            gap = (f" GPU could use '{prof['ideal_variant']}' but that variant is not "
-                   f"built; build it to unlock it." if prof["ideal_variant"] != variant else "")
+            tier = quant or "bf16"
+            note = " (memory-fit; experimental quant)" if quant else ""
             print(f"[core] GPU {prof['name']} arch={prof['arch']} sm_{prof['cc']} "
-                  f"vram={prof['vram_gb']:.0f}GB fp8={prof['fp8_native']} fp4={prof['fp4_native']} "
-                  f"-> loading variant '{variant}' ({dtype}).{gap}", flush=True)
+                  f"vram={prof['vram_gb']:.0f}GB -> weight precision '{tier}'{note}.",
+                  flush=True)
         t0 = time.perf_counter()
-        source = resolve_model_source(variant)
-        gen = load_miso_8b(device, model_path_or_repo_id=source, dtype=dtype)
-        quant = os.environ.get("MISO_QUANTIZE")
-        if quant:
-            _apply_quant(gen, quant)
+        # Prefer a pre-quantized checkpoint (smaller download, no load-time quant).
+        # Fall back to bf16-quantized-at-load if the repo is absent OR the
+        # pre-quantized load fails -- e.g. the int4 tinygemm layout is packed for
+        # the build GPU's architecture and may not load on a different arch, whereas
+        # quant-at-load re-packs correctly for whatever GPU is present.
+        gen = None
+        prequant = resolve_prequant_source(quant) if quant else None
+        if prequant:
+            try:
+                gen = load_miso_8b(device, model_path_or_repo_id=prequant, prequantized=True)
+            except Exception as exc:
+                print(f"[core] pre-quantized {quant} load failed "
+                      f"({type(exc).__name__}: {exc}); quantizing bf16 at load", flush=True)
+                gen = None
+        if gen is None:
+            source = resolve_model_source("bf16")
+            gen = load_miso_8b(device, model_path_or_repo_id=source, dtype=torch.bfloat16,
+                               quantize=quant)
         _maybe_compile(gen)
         print(f"[core] model loaded on {device} in {time.perf_counter() - t0:.1f}s", flush=True)
         _GEN = gen

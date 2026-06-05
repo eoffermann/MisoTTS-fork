@@ -391,37 +391,104 @@ def _skip_random_init():
             setattr(I, n, fn)
 
 
+QUANT_SCHEMES = ("int8", "int4")
+
+
+def _quantize_and_move(model: Model, scheme: str, device: str, dtype: torch.dtype) -> None:
+    """Weight-only quantize the backbone/decoder Linear layers WHILE moving the
+    model to `device`, without ever materializing the full bf16 model on `device`.
+
+    The point is fitting a card that cannot hold the ~17 GB bf16 model: we quantize
+    layer by layer, so the device only ever holds the already-quantized weights plus
+    one bf16 layer in flight. Each target Linear is moved to `device` and quantized
+    in place (its bf16 weight is freed as the int8/int4 weight replaces it), keeping
+    the device peak near the quantized model size (~10 GB int8, ~6-7 GB int4) rather
+    than the bf16 peak. int4 packing (tinygemm `_convert_weight_to_int4pack`) is
+    CUDA-only, so it MUST happen on the device; the same layer-wise path serves int8.
+
+    This is weight-only quantization: weights are stored int8/int4 and dequantized
+    to `dtype` for the matmul. For MisoTTS it is purely a MEMORY lever, not a speed
+    one - the frame-by-frame decode's tiny per-step matmuls (M=1 backbone, M=10
+    decoder) cannot feed the hardware low-precision GEMMs (int8 `_int_mm`, fp8/fp4
+    `_scaled_mm` all require M>=16), so dynamic/activation quant and hardware
+    fp8/nvfp4 give no compute win here. Integer weight-only delivers the memory
+    saving on ANY GPU, which is what lowers the hardware floor. The embeddings,
+    output heads, and projection stay in `dtype` (small and precision-sensitive).
+    """
+    import torch.nn as nn
+    from torchao.quantization import quantize_, int8_weight_only, int4_weight_only
+
+    cfg = {"int8": int8_weight_only, "int4": int4_weight_only}.get(scheme)
+    if cfg is None:
+        raise ValueError(f"unknown quantize scheme {scheme!r}; expected one of {QUANT_SCHEMES}")
+
+    model.to(dtype=dtype)  # cast to the compute dtype on CPU before quantizing
+    n = 0
+    for fqn, mod in model.named_modules():
+        if isinstance(mod, nn.Linear) and "head" not in fqn and "projection" not in fqn:
+            mod.to(device)
+            quantize_(mod, cfg())
+            n += 1
+    model.to(device)  # move the remaining (unquantized) params: embeddings, heads, norms
+    print(f"[load] {scheme} weight-only: quantized {n} Linear layers; model on {device}",
+          flush=True)
+
+
 def _load_model(
     model_path_or_repo_id: str,
     config: ModelArgs,
     device: str,
     dtype: torch.dtype,
+    quantize: Optional[str] = None,
+    prequantized: bool = False,
 ) -> Model:
     if os.path.isfile(model_path_or_repo_id):
         model_file = model_path_or_repo_id
     elif os.path.isdir(model_path_or_repo_id):
-        model_file = os.path.join(model_path_or_repo_id, "model.safetensors")
+        name = "model.pt" if prequantized else "model.safetensors"
+        model_file = os.path.join(model_path_or_repo_id, name)
     else:
-        model_file = hf_hub_download(repo_id=model_path_or_repo_id, filename="model.safetensors")
+        name = "model.pt" if prequantized else "model.safetensors"
+        model_file = hf_hub_download(repo_id=model_path_or_repo_id, filename=name)
 
-    if os.path.isfile(model_file):
-        with _skip_random_init():
-            model = Model(config)
-        if model_file.endswith(".safetensors"):
-            try:
-                from safetensors.torch import load_file
-            except ImportError as exc:
-                raise ImportError("Install safetensors to load .safetensors checkpoint files") from exc
-
-            state_dict = load_file(model_file, device="cpu")
-        else:
-            checkpoint = torch.load(model_file, map_location="cpu")
-            state_dict = _state_dict_from_checkpoint(checkpoint)
-        model.load_state_dict(state_dict)
-    else:
+    if not os.path.isfile(model_file):
         raise FileNotFoundError(f"Could not resolve model checkpoint: {model_path_or_repo_id}")
 
-    model.to(device=device, dtype=dtype)
+    with _skip_random_init():
+        model = Model(config)
+
+    if prequantized:
+        # A torch.save'd quantized state_dict: torchao AffineQuantizedTensor weights
+        # for the backbone/decoder Linears, bf16 elsewhere (see
+        # deploy/build_quant_checkpoint.py). Load with assign=True so each param
+        # OBJECT is replaced by the quantized tensor (you cannot copy_ an int8/int4
+        # tensor into the fp32 Parameter the model was built with). weights_only is
+        # False because unpickling the tensor subclass needs it -- only load
+        # checkpoints you trust (our own BigBlueCeiling repos).
+        state_dict = torch.load(model_file, map_location="cpu", weights_only=False)
+        model.load_state_dict(state_dict, assign=True)
+        model.to(device)
+    elif model_file.endswith(".safetensors"):
+        try:
+            from safetensors.torch import load_file
+        except ImportError as exc:
+            raise ImportError("Install safetensors to load .safetensors checkpoint files") from exc
+        model.load_state_dict(load_file(model_file, device="cpu"))
+        if quantize:
+            # Quantize layer-wise while moving to `device` so a small card never has
+            # to hold the full bf16 model (see _quantize_and_move). This is the
+            # fallback when a pre-quantized repo is unavailable.
+            _quantize_and_move(model, quantize, device, dtype)
+        else:
+            model.to(device=device, dtype=dtype)
+    else:
+        checkpoint = torch.load(model_file, map_location="cpu")
+        model.load_state_dict(_state_dict_from_checkpoint(checkpoint))
+        if quantize:
+            _quantize_and_move(model, quantize, device, dtype)
+        else:
+            model.to(device=device, dtype=dtype)
+
     model.eval()
     return model
 
@@ -430,7 +497,10 @@ def load_miso_8b(
     device: str = "cuda",
     model_path_or_repo_id: Optional[str] = None,
     dtype: torch.dtype = torch.bfloat16,
+    quantize: Optional[str] = None,
+    prequantized: bool = False,
 ) -> Generator:
     source = model_path_or_repo_id or os.environ.get("MISO_TTS_8B_MODEL", DEFAULT_MISO_TTS_REPO_ID)
-    model = _load_model(source, MISO_TTS_8B_CONFIG, device=device, dtype=dtype)
+    model = _load_model(source, MISO_TTS_8B_CONFIG, device=device, dtype=dtype,
+                        quantize=quantize, prequantized=prequantized)
     return Generator(model)
