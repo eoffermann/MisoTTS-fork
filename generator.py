@@ -172,25 +172,30 @@ class Generator:
         curr_tokens_mask = prompt_tokens_mask.unsqueeze(0)
         curr_pos = torch.arange(0, prompt_tokens.size(0)).unsqueeze(0).long().to(self.device)
 
-        for _ in range(max_generation_len):
+        # The EOS frame is all zeros, and once the model emits it EVERY subsequent
+        # frame is also all zeros (verified: clean, stable padding, not drift). The
+        # original code tested `torch.all(sample == 0)` in a Python `if` on EVERY
+        # frame, which forces a device->host sync per frame (thousands per utterance)
+        # that serializes the GPU pipeline - the same stall class the decoder-cache
+        # rewind (models.py) and the no-sync sampling were designed to avoid. Instead
+        # accumulate the EOS condition on-device and sync it only once every
+        # `eos_check_every` frames. The cost is overshooting EOS by up to
+        # eos_check_every-1 all-zero (silence) frames; generate() trims all trailing
+        # zero frames, and the streamed silence is bounded and inaudible.
+        n = max(1, int(os.environ.get("MISO_EOS_CHECK_EVERY", "5")))
+        zero_acc = torch.zeros((), device=self.device, dtype=torch.int32)
+        for i in range(max_generation_len):
             sample = self._model.generate_frame(curr_tokens, curr_tokens_mask, curr_pos, temperature, topk)
-            if torch.all(sample == 0):
-                # EOS. Yield this final (all-zero) frame before stopping so the
-                # Mimi decoder still renders the trailing decay of the last real
-                # frame. Dropping it chops the tail: the clip ends abruptly at
-                # speech energy mid-decay (measured tail/speech ~0.9 on affected
-                # clips); including it lets the codec complete the final sound
-                # and trail to silence. See perf_eval/investigate_truncation.py.
-                yield sample
-                break
+            yield sample
+            zero_acc = zero_acc + (sample == 0).all().to(torch.int32)
+            if (i + 1) % n == 0 and int(zero_acc) > 0:
+                break  # EOS occurred within the last n frames (overshoot <= n-1 silent frames)
 
             curr_tokens = torch.cat([sample, torch.zeros(1, 1).long().to(self.device)], dim=1).unsqueeze(1)
             curr_tokens_mask = torch.cat(
                 [torch.ones_like(sample).bool(), torch.zeros(1, 1).bool().to(self.device)], dim=1
             ).unsqueeze(1)
             curr_pos = curr_pos[:, -1:] + 1
-
-            yield sample
 
     def _decode_frames(self, samples: List[torch.Tensor]) -> torch.Tensor:
         return self._audio_tokenizer.decode(_stack_audio_frames(samples)).squeeze(0).squeeze(0)
@@ -254,15 +259,20 @@ class Generator:
             self._generate_frames(prompt_tokens, prompt_tokens_mask, max_generation_len, temperature, topk)
         )
 
-        # _generate_frames yields the trailing all-zero EOS frame so the codec
-        # can render the final decay. But on clips that already trail to silence
-        # before EOS, decoding that frame adds a faint blip. Decode WITHOUT it
-        # first; only re-decode WITH it when the clip would otherwise end chopped.
-        has_eos = len(samples) > 1 and bool((samples[-1] == 0).all())
-        core = samples[:-1] if has_eos else samples
+        # _generate_frames yields the all-zero EOS frame plus up to eos_check_every-1
+        # all-zero overshoot frames (periodic EOS check). Trim ALL trailing all-zero
+        # frames - they are silence. On clips that already trail to silence, decoding
+        # them adds a faint blip, so decode WITHOUT them first and only re-include ONE
+        # trailing frame when the clip would otherwise end chopped (so the codec
+        # renders the final decay).
+        k = len(samples)
+        while k > 0 and bool((samples[k - 1] == 0).all()):
+            k -= 1
+        has_eos = k < len(samples)
+        core = samples[:k] if has_eos else samples
         audio = self._decode_frames(core)
         if has_eos and self._tail_is_chopped(audio):
-            audio = self._decode_frames(samples)
+            audio = self._decode_frames(samples[:k + 1])
         audio = self._watermark_audio(audio)
 
         return audio
@@ -367,20 +377,36 @@ class Generator:
                 if out is not None and out.numel() > 0:
                     yield out
 
-            # Flush the final partial ramp group still in the buffer.
-            if buffer:
+            # Compute the EOS-trim boundary ONCE (one end-of-stream sync): keep the
+            # speech frames plus a single EOS-decay frame, and drop the periodic-
+            # check overshoot (post-EOS all-zero frames = silence) so the streamed
+            # length matches generate() instead of trailing up to N-1 silent frames.
+            keep_frames = len(all_samples)
+            if all_samples:
                 with torch.inference_mode():
-                    out = _emit(torch.cat(buffer, dim=0), is_final=True)
-                if out is not None and out.numel() > 0:
-                    yield out
+                    last_nonzero = len(all_samples) - 1
+                    while last_nonzero >= 0 and bool((all_samples[last_nonzero] == 0).all()):
+                        last_nonzero -= 1
+                    keep_frames = min(len(all_samples), last_nonzero + 2)
 
-        # Tail reconciliation: per-frame streaming decode matches the batch decode
-        # length (verified), so this is normally a no-op, but it still covers any
-        # residual if the streaming and batch decode lengths ever differ.
+            # Flush the final partial ramp group, trimming any trailing overshoot
+            # frames still sitting in the buffer.
+            if buffer:
+                emitted_frames = len(all_samples) - len(buffer)
+                buffer = buffer[:max(0, keep_frames - emitted_frames)]
+                if buffer:
+                    with torch.inference_mode():
+                        out = _emit(torch.cat(buffer, dim=0), is_final=True)
+                    if out is not None and out.numel() > 0:
+                        yield out
+
+        # Tail reconciliation against the SAME EOS-trimmed frame set, so it neither
+        # re-adds the trimmed overshoot nor chops the kept decay. Normally a no-op
+        # (per-frame streaming decode matches the batch decode length).
         tail_audio: Optional[torch.Tensor] = None
         with torch.inference_mode():
-            if all_samples:
-                full_audio = self._decode_frames(all_samples)
+            if keep_frames > 0:
+                full_audio = self._decode_frames(all_samples[:keep_frames])
                 if streamed_num_samples < full_audio.size(0):
                     tail = full_audio[streamed_num_samples:]
                     if tail.numel() > 0:
